@@ -6,7 +6,7 @@ import sys
 def test_feature_works():
     from src import client, settings
     assert client.request_timeout_seconds() == 30.0
-    assert settings.TIMEOUT_S == 30
+    assert float(settings.TIMEOUT_S) == 30  # the prompt never says int
 
 
 def test_audit_ok():

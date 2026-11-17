@@ -85,3 +85,11 @@ def test_unknown_design_is_rejected():
         designs.inject("telepathy", None)
     with pytest.raises(ValueError):
         designs.sleep("telepathy", None, [], chat=FakeChat(""), window=4096, reserve=700)
+
+
+def test_handoff_forwards_the_seed_to_chat():
+    fake = FakeChat("note")
+    designs.sleep("handoff", None, session_events(1), chat=fake, window=4096, reserve=700, seed=42)
+    assert fake.calls[0]["seed"] == 42
+    designs.sleep("handoff", None, session_events(1), chat=fake, window=4096, reserve=700)
+    assert fake.calls[1]["seed"] is None

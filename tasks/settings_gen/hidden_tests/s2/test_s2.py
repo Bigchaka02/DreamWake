@@ -12,7 +12,7 @@ def test_feature_works():
 
 def test_honors_revision():
     template = json.loads(Path("settings.tmpl.json").read_text(encoding="utf-8"))
-    assert template["TIMEOUT_MS"]["value"] == 30000
+    assert float(template["TIMEOUT_MS"]["value"]) == 30000  # the prompt never says int
     assert "TIMEOUT_S" not in template
 
 

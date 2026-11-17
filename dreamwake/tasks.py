@@ -71,9 +71,13 @@ def _cap(text):
 def run_check(task_id, workspace_dir, timeout_s=60):
     """Run the task's check steps in order, stopping at the first failure. Returns (code, text)."""
     parts = []
+    root = str(Path(workspace_dir).resolve())
     for command in load_task(task_id)["check_cmd"]:
         argv = [sys.executable] + command.split()[1:]  # "python ..." -> this interpreter
         code, out = _run(argv, workspace_dir, timeout_s, PYTEST_ADDOPTS="--tb=short -p no:cacheprovider")
+        # the model must not see where the workspace lives: plain, posix and repr'd spellings
+        for spelling in (root, root.replace("\\", "/"), root.replace("\\", "\\\\")):
+            out = re.sub(re.escape(spelling), ".", out, flags=re.I)
         parts += ["$ " + command, _compact(out)]
         if code != 0:
             return code, _cap("\n".join(parts + [f"checks FAILED (exit {code})"]))
@@ -90,7 +94,9 @@ def evaluate(task_id, stage, workspace_dir, baseline_dir=None, timeout_s=120):
     env = {} if baseline_dir is None else {"DW_BASELINE_DIR": str(Path(baseline_dir).resolve())}
     with tempfile.TemporaryDirectory() as tmp:
         work = _copy(workspace_dir, Path(tmp) / "ws")
-        _copy(task["workspace"] / "tests", work / "tests")  # restore the original visible tests
+        for name in task["protected"]:  # never run checker code the agent could have edited
+            shutil.rmtree(work / name, ignore_errors=True)
+            _copy(task["workspace"] / name, work / name)
         _copy(hidden, Path(tmp) / "hidden")
         code, out = _run([sys.executable, "tools/gen.py"], work, timeout_s)
         if code != 0:

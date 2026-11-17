@@ -32,6 +32,10 @@ class FakeChat:
 FINISH = reply(("finish", {"summary": "done"}))
 
 
+def with_prompt_tokens(a_reply, prompt_tokens):
+    return {**a_reply, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 10}}
+
+
 @pytest.fixture
 def ws(tmp_path):
     return tasks.make_workspace(TASK, tmp_path / "ws")
@@ -160,6 +164,20 @@ def test_seed_differs_per_step(ws):
     assert [c["seed"] for c in fake.calls] == [1001, 1002, 1003]
 
 
+def test_ended_by_says_why_the_session_stopped(ws):
+    result, _ = run(ws, [FINISH])
+    assert result["ended_by"] == "finish"
+    result, _ = run(ws, [reply(("list_files", {}))] * 3, max_steps=3)
+    assert result["ended_by"] == "max_steps" and result["ran_out_of_steps"]
+    result, _ = run(ws, [reply(content="a"), reply(content="b")], max_steps=2)  # two silent replies on the last step
+    assert result["ended_by"] == "no_tool_calls" and not result["ran_out_of_steps"]
+    result, _ = run(ws, [reply(content="a"), reply(content="b"), FINISH])
+    assert result["ended_by"] == "no_tool_calls" and result["steps"] == 2
+    fake = OverflowOnce([FINISH], overflow_on=[1])
+    result = agent.run_session(TASK, ws, PROMPT, chat=fake, max_steps=10, window=100_000, reserve=500)
+    assert result["ended_by"] == "overflow" and not result["ran_out_of_steps"]
+
+
 def test_tools_work_inside_the_workspace(ws):
     (ws / "src" / "__pycache__").mkdir()
     (ws / "src" / "__pycache__" / "x.pyc").write_bytes(b"")
@@ -196,6 +214,42 @@ def test_paths_outside_the_workspace_are_refused(ws, call):
     text = results(result)[0]
     assert text.startswith("error") and "outside" in text and "secret" not in text
     assert not (ws.parent / "evil.txt").exists()
+
+
+def test_tool_errors_give_the_relative_path_and_the_plain_reason_only(ws):
+    result, _ = run(ws, [reply(("read_file", {"path": "nope.txt"})), reply(("write_file", {"path": "src", "content": "x"})),
+                         reply(("read_file", {"path": "src"})), FINISH])
+    missing, *others = results(result)[:3]
+    assert missing == "error: No such file or directory: nope.txt"
+    for text in [missing, *others]:
+        assert text.startswith("error:") and str(ws.resolve()) not in text and str(ws.parent) not in text, text
+
+
+def test_writing_an_existing_file_that_was_not_read_is_refused_and_leaves_it_alone(ws):
+    original = (ws / "CHANGES.md").read_bytes()
+    result, _ = run(ws, [reply(("write_file", {"path": "CHANGES.md", "content": "new"})), FINISH])
+    assert results(result)[0] == ("error: CHANGES.md already exists - read_file it first, "
+                                  "then write its complete new content")
+    assert (ws / "CHANGES.md").read_bytes() == original
+
+
+def test_an_existing_file_can_be_written_after_it_was_read_however_the_path_is_spelled(ws):
+    result, _ = run(ws, [reply(("read_file", {"path": "./CHANGES.md"})),
+                         reply(("write_file", {"path": "CHANGES.md", "content": "new"})), FINISH])
+    assert results(result)[1].startswith("wrote") and (ws / "CHANGES.md").read_text(encoding="utf-8") == "new"
+
+
+def test_a_file_the_agent_created_can_be_rewritten_without_reading_it(ws):
+    result, _ = run(ws, [reply(("write_file", {"path": "new.txt", "content": "1"})),
+                         reply(("write_file", {"path": "new.txt", "content": "2"})), FINISH])
+    assert all(text.startswith("wrote") for text in results(result)[:2])
+    assert (ws / "new.txt").read_text(encoding="utf-8") == "2"
+
+
+def test_each_session_starts_with_nothing_read(ws):
+    result, _ = run(ws, [reply(("read_file", {"path": "CHANGES.md"})), FINISH])
+    result, _ = run(ws, [reply(("write_file", {"path": "CHANGES.md", "content": "new"})), FINISH])
+    assert results(result)[0].startswith("error") and (ws / "CHANGES.md").read_text(encoding="utf-8") != "new"
 
 
 def test_bad_arguments_and_unknown_tools_give_error_results(ws):
@@ -266,8 +320,8 @@ def test_trimming_keeps_pinned_messages_never_splits_units_and_fits_the_window(w
     pinned = probe.calls[0]["messages"]
     reserve = 200
     window = agent.estimate_prompt(pinned) + reserve + 900
-    replies = [reply(("read_file", {"path": "README.md"}))] * 8 + [FINISH]
-    result, fake = run(ws, replies, window=window, reserve=reserve)
+    replies = [with_prompt_tokens(reply(("read_file", {"path": "README.md"})), 100_000) for _ in range(8)]
+    result, fake = run(ws, replies + [with_prompt_tokens(FINISH, 100_000)], window=window, reserve=reserve)
     assert result["finished"] and result["dropped_units"] > 0
     assert len([e for e in result["events"] if e["type"] == "call"]) == 9  # events stay untrimmed
     marked = 0
@@ -323,6 +377,29 @@ def test_context_overflow_with_nothing_left_to_drop_ends_the_session(ws):
 def test_pinned_messages_larger_than_the_window_raise(ws):
     with pytest.raises(ValueError, match="window"):
         run(ws, [FINISH], window=300, reserve=200)
+
+
+def test_token_estimate_is_calibrated_to_the_servers_prompt_count(ws, tmp_path):
+    _, probe = run(ws, [FINISH])
+    reserve = 200
+    window = agent.estimate_prompt(probe.calls[0]["messages"]) + reserve + 900  # too small for the raw estimate
+    log = tmp_path / "log.jsonl"
+    replies = [with_prompt_tokens(reply(("read_file", {"path": "README.md"})), 50) for _ in range(8)]
+    result, fake = run(ws, replies + [with_prompt_tokens(FINISH, 50)], window=window, reserve=reserve, log_path=log)
+    assert result["finished"] and result["dropped_units"] == 0
+    ratio = 1.1 * 50 / agent.estimate_prompt(fake.calls[0]["messages"])
+    steps = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [s["ratio"] for s in steps if s["type"] == "step"][0] == pytest.approx(ratio)
+
+
+def test_ratio_is_capped_at_one_and_ignores_replies_without_a_prompt_count(ws, tmp_path):
+    log = tmp_path / "log.jsonl"
+    list_files = reply(("list_files", {}))
+    replies = [with_prompt_tokens(list_files, n) for n in (50, 0, 100_000)] + [FINISH]
+    run(ws, replies, log_path=log)
+    ratios = [json.loads(line)["ratio"] for line in log.read_text(encoding="utf-8").splitlines()
+              if json.loads(line)["type"] == "step"]
+    assert ratios[0] < 1.0 and ratios[1] == ratios[0] and ratios[2] == 1.0
 
 
 def test_log_path_gets_events_and_one_line_per_step(ws, tmp_path):

@@ -11,7 +11,7 @@ NOTE_CAP = 900
 FRAMING_TOKENS = 50  # chat-template tokens around the single message, by estimate
 
 
-def sleep(design, artifact, events, *, chat, window, reserve):
+def sleep(design, artifact, events, *, chat, window, reserve, seed=None):
     """Turn one session's events into the design's artifact. Returns (artifact, cost)."""
     cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     if design == "workspace":
@@ -23,7 +23,7 @@ def sleep(design, artifact, events, *, chat, window, reserve):
         tail = "\n\n" + HANDOFF_INSTRUCTION
         max_chars = max(0, int(CHARS_PER_TOKEN * (window - reserve - estimate_tokens(head + tail) - FRAMING_TOKENS)))
         prompt = head + render_events(rest, max_chars) + tail
-        reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve)
+        reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve, seed=seed)
         cost = {"calls": 1, **reply["usage"], "seconds": reply["seconds"]}
         return (reply["content"] or "").strip()[:NOTE_CAP], cost
     raise ValueError(f"unknown design: {design!r}")

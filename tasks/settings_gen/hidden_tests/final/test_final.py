@@ -24,7 +24,7 @@ def test_honors_revision():
     new = new_keys()
     assert len(new) == 1, f"expected exactly one new setting, got {sorted(new)}"
     [(key, entry)] = new.items()
-    assert key.endswith("_MS") and entry["value"] == 2000
+    assert key.endswith("_MS") and float(entry["value"]) == 2000
 
 
 def test_trap_avoided():

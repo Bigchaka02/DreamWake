@@ -45,8 +45,9 @@ def _inside(workspace, path):
     return target
 
 
-def _execute(task_id, workspace, name, args):
-    """Run one tool call and return its result text; bad model input becomes an error string."""
+def _execute(task_id, workspace, name, args, known):
+    """Run one tool call and return its result text; bad model input becomes an error string.
+    known: the files this session has read or written (updated here); an unknown existing file is not overwritten."""
     if name not in REQUIRED:
         return f"error: unknown tool '{name}'; the tools are {', '.join(REQUIRED)}"
     if not isinstance(args, dict):
@@ -60,17 +61,25 @@ def _execute(task_id, workspace, name, args):
                            if p.is_file() and not SKIP_DIRS & set(p.relative_to(workspace).parts))
             return "\n".join(files) or "(no files)"
         if name == "read_file":
-            text = _inside(workspace, args["path"]).read_text(encoding="utf-8", errors="replace")
+            target = _inside(workspace, args["path"])
+            text = target.read_text(encoding="utf-8", errors="replace")
+            known.add(target)
             return text if len(text) <= READ_CAP else text[:READ_CAP] + f"\n[... cut at {READ_CAP} characters ...]"
         if name == "write_file":
             target = _inside(workspace, args["path"])
+            if target.is_file() and target not in known:  # models overwrote CHANGES.md blind and lost its entries
+                return f"error: {args['path']} already exists - read_file it first, then write its complete new content"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(args["content"], encoding="utf-8", newline="")
+            known.add(target)
             return f"wrote {len(args['content'])} characters to {args['path']}"
         if name == "run_tests":
             return tasks.run_check(task_id, workspace)[1]
         return "finished"
-    except (OSError, ValueError) as error:
+    except OSError as error:  # not str(error): it embeds the absolute path
+        where = f": {args['path']}" if "path" in args else ""
+        return f"error: {error.strerror}{where}" if error.strerror else f"error: {error}"
+    except ValueError as error:
         return f"error: {error}"
 
 
@@ -84,6 +93,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
     log = list(events)
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "max_prompt_tokens": 0}
     steps, finished, silent, overflow, start = 0, False, 0, False, time.perf_counter()
+    known, ratio = set(), 1.0  # ratio: the server's prompt token count over our estimate, once measured
     try:
         while steps < max_steps and not finished and silent < 2:
             steps += 1
@@ -91,7 +101,8 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
             while reply is None:
                 messages = (pinned + ([{"role": "user", "content": MARKER}] if dropped else [])
                             + [m for unit in units[dropped:] for m in unit])
-                if estimate_prompt(messages) > window - reserve:
+                raw = estimate_prompt(messages)
+                if raw * ratio > window - reserve:
                     if dropped == len(units):
                         raise ValueError(f"system prompt, tools and request alone exceed the window "
                                          f"({window} - {reserve})")
@@ -108,11 +119,13 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
             if overflow:
                 break
             usage = reply["usage"]
+            if usage["prompt_tokens"] > 0:  # 1.1: keep a margin; never trust the server more than the estimate
+                ratio = min(1.0, 1.1 * usage["prompt_tokens"] / raw)
             totals["prompt_tokens"] += usage["prompt_tokens"]
             totals["completion_tokens"] += usage["completion_tokens"]
             totals["max_prompt_tokens"] = max(totals["max_prompt_tokens"], usage["prompt_tokens"])
             log.append({"type": "step", "step": steps, **usage, "seconds": reply["seconds"],
-                        "finish_reason": reply["finish_reason"], "dropped_units": dropped})
+                        "finish_reason": reply["finish_reason"], "dropped_units": dropped, "ratio": ratio})
             content = reply["content"] or ""
             if reply["tool_calls"]:
                 silent = 0
@@ -122,7 +135,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
                          "args": call["arguments"] if isinstance(call["arguments"], dict) else {"raw": call["raw"]}}
                 if content:
                     event["content"] = content
-                text = _execute(task_id, workspace, call["name"], call["arguments"])
+                text = _execute(task_id, workspace, call["name"], call["arguments"], known)
                 finished = call["name"] == "finish" and not text.startswith("error")
                 new = [event, {"type": "result", "step": steps, "text": text}]
                 # LM Studio rejects (HTTP 500) or garbles a replayed call whose arguments are not a JSON object
@@ -141,8 +154,9 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
         if log_path:
             Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             Path(log_path).write_text("".join(json.dumps(line) + "\n" for line in log), encoding="utf-8")
-    return {"finished": finished, "steps": steps,
-            "ran_out_of_steps": not finished and not overflow and steps >= max_steps, "overflow": overflow,
+    ended_by = "finish" if finished else "overflow" if overflow else "no_tool_calls" if silent >= 2 else "max_steps"
+    return {"finished": finished, "steps": steps, "ended_by": ended_by,
+            "ran_out_of_steps": ended_by == "max_steps", "overflow": overflow,
             "events": events, **totals, "seconds": time.perf_counter() - start, "dropped_units": dropped}
 
 
