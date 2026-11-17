@@ -666,7 +666,7 @@ def test_specs_wire_final_and_practice_placement_and_gate_with_safe_paths(tmp_pa
     assert len(finals) == 2
     assert all(kwargs["memory"] == "" and not kwargs.get("finish_gate", False) and not session["gated"]
                for _, _, kwargs, session in wakes)
-    if store in ("replay", "dreaming"):
+    if store == "replay":
         assert practices
         assert all(workspace.parent.name in (f"practice_{label}_s1", f"practice_{label}_s2")
                    for workspace, _, _ in practices)
@@ -688,7 +688,9 @@ def tree(root):
 def test_dreaming_and_replay_practise_on_snapshots_of_the_wake_and_log_it(tmp_path, monkeypatch):
     out = tmp_path / "out"
     memory = '{"kind": "rule", "text": "Store durations in milliseconds with the _MS suffix."}'
-    dreams = ["Add `CACHE_TTL_SECONDS` of 5 seconds.", "Add a poll interval of 9 seconds."]  # they add nothing
+    dreams = ["Add a cache lifetime of 5 seconds.", "Add a poll interval of 9 seconds."]  # controls add nothing
+    decision = ("This replaces the earlier decision to store durations in seconds: every duration setting is now "
+                "stored in milliseconds, and its name ends in _MS.")
     inner = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")}, memory)
     practised = []
     real = agent.run_session
@@ -702,8 +704,9 @@ def test_dreaming_and_replay_practise_on_snapshots_of_the_wake_and_log_it(tmp_pa
     def chat(messages, tools=None, **kwargs):
         prompt = messages[-1]["content"] if tools is None else messages[1]["content"]
         if tools is None and prompt.endswith(designs.DREAM_INSTRUCTION):
-            content = "\n".join(json.dumps({"request": d, "must_add": ["_MS"], "must_not_add": []}) for d in dreams)
-        elif tools is not None and prompt in dreams:
+            content = json.dumps({"exercises": [{"decision": decision, "request": d, "must_add": ["_MS"],
+                                                 "must_not_add": []} for d in dreams]})
+        elif tools is not None and any(prompt.startswith(d) for d in dreams):
             return {"content": "", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}, "raw": "{}"}],
                     "usage": {"prompt_tokens": 500, "completion_tokens": 50}, "seconds": 1.0,
                     "finish_reason": "tool_calls"}
@@ -720,26 +723,29 @@ def test_dreaming_and_replay_practise_on_snapshots_of_the_wake_and_log_it(tmp_pa
         assert result[design]["practice_log"] == [] and result[design]["contamination"] == []
     replay, dreaming = result["replay"]["practice_log"], result["dreaming"]["practice_log"]
     assert len(replay) == len(dreaming) == 2  # one record per sleep, s1 first
-    assert all(set(r) == {"exercises", "refined", "accepted", "items_before", "candidate"}
-               and len(r["exercises"]) == 2 for r in replay + dreaming)
+    assert all(set(r) == {"exercises", "dreams_offered", "dream_replies", "items_before", "edit", "candidate",
+                          "refined", "accepted", "reason"} for r in replay + dreaming)
+    assert all(len(r["exercises"]) == 5 for r in replay)
+    assert all(r["exercises"] == [] and r["reason"] == "no verified dreams" for r in dreaming)
     entries = [(r, e) for r in replay + dreaming for e in r["exercises"]]
-    assert all(set(e) == {"request", "hypothetical", "must_add", "must_not_add", "score", "score2", "check_passed",
-                          "check_passed2", "missing", "present", "missing2", "present2"} for _, e in entries)
-    assert [[e["request"] for e in r["exercises"]] for r in replay] == [[prompts["s1"]] * 2, [prompts["s2"]] * 2]
-    assert [(e["score"], e["score2"], e["check_passed"]) for r in replay for e in r["exercises"]] == [
-        (0, None, True)] * 4  # the scripted agent passes its real sessions
+    assert all(set(e) == {"request", "hypothetical", "decision", "must_add", "must_not_add", "score", "scores2", "check_passed",
+                          "missing", "present"} for _, e in entries)
+    assert [[e["request"] for e in r["exercises"]] for r in replay] == [[prompts["s1"]] * 5, [prompts["s2"]] * 5]
+    assert [(e["score"], e["scores2"], e["check_passed"]) for r in replay for e in r["exercises"]] == [
+        (0, None, True)] * 10  # the scripted agent passes its real sessions
     assert not any(r["refined"] for r in replay)
-    assert [[e["request"] for e in r["exercises"]] for r in dreaming] == [dreams, dreams]
-    assert all(e["hypothetical"] and e["must_add"] == ["_MS"] for r in dreaming for e in r["exercises"])
-    assert [(e["score"], e["score2"]) for r in dreaming for e in r["exercises"]] == [(1, 1)] * 4  # adds no _MS
-    assert all(r["refined"] and not r["accepted"] for r in dreaming)
-    for design, sessions, calls in (("dreaming", 8, 4), ("replay", 4, 0)):  # dream + refine per sleep
+    assert all(len(r["dreams_offered"]) == 2 for r in dreaming)
+    assert all(d["rejected"] == "decision is not the user's words" and d["control_score"] is None
+               for d in dreaming[0]["dreams_offered"])
+    assert all(d["control_score"] == 1 for d in dreaming[1]["dreams_offered"])
+    assert not any(r["refined"] or r["accepted"] for r in dreaming)
+    for design, sessions, calls in (("dreaming", 2, 2), ("replay", 10, 0)):
         assert result[design]["memory"] == result["consolidated"]["memory"]
         assert result[design]["sleep_cost"]["practice_sessions"] == sessions
         assert result[design]["sleep_cost"]["calls"] == result["consolidated"]["sleep_cost"]["calls"] + calls
         assert result[design]["contamination"] == []
-    assert [name for name, _ in practised] == (["practice_dreaming_s1"] * 4 + ["practice_dreaming_s2"] * 4
-                                               + ["practice_replay_s1"] * 2 + ["practice_replay_s2"] * 2)
+    assert [name for name, _ in practised] == (["practice_dreaming_s2"] * 2
+                                               + ["practice_replay_s1"] * 5 + ["practice_replay_s2"] * 5)
     seed_dir = out / "seed0"
     fresh = tasks.make_workspace(TASK, tmp_path / "fresh")
     assert tree(seed_dir / "snap_s1_before") == tree(fresh)

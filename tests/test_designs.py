@@ -471,86 +471,24 @@ def test_hybrid_empty(artifact):
     assert designs.inject("hybrid", artifact) == ""
 
 
-# --- dreaming and replay: practise with the memory, keep a rewrite only if practice improves -------
+# --- dreaming and replay --------------------------------------------------------------------------
 
-TASK = "settings_gen"
+TASK = "practice_tiny"
 REAL = "Rename TIMEOUT_S to TIMEOUT_MS with value 30000. Make the checks pass."
-DREAMS = [{"request": "Add a cache lifetime of 5 seconds.", "must_add": ["_MS"], "must_not_add": ["_SECONDS"]},
-          {"request": "Add a poll interval of 9 seconds.", "must_add": ["_MS"], "must_not_add": ["_SECONDS"]}]
-SPECIFIC = ("rule", "Store every duration in milliseconds: name it <NAME>_MS, e.g. RETRY_DELAY_MS = 2000.")
+DECISION = "Store every duration in milliseconds with the _MS suffix."
+DREAMS = [{"decision": DECISION, "request": request, "must_add": ["_MS"], "must_not_add": ["_SECONDS"]}
+          for request in ("Add a cache lifetime of 5 seconds.", "Add a poll interval of 9 seconds.")]
+SPECIFIC = ("rule", "Store every duration in milliseconds with _MS; convert requests in seconds.")
 ITEMS = [{"kind": k, "text": t} for k, t in (MILLIS, LESSON)]
 REFINED = [{"kind": k, "text": t} for k, t in (SPECIFIC, LESSON)]
 MEMORY = designs.inject("consolidated", {"items": ITEMS})
 CANDIDATE = designs.inject("consolidated", {"items": REFINED})
 RULES = f"RULES:\n1. RULE: {MILLIS[1]}\n2. LESSON: {LESSON[1]}\n\n"
-WRITTEN = {0: "POLL_MS = 1", 1: "nothing", 2: "POLL_SECONDS = 1"}  # what scores 0, 1, 2 against a DREAMS entry
+WRITTEN = {0: "POLL_MS = 1", 1: "nothing", 2: "POLL_SECONDS = 1"}
 
 
-def dream_lines(*dreams):
-    return "\n".join(json.dumps(d) for d in dreams)
-
-
-def snapshots(tmp_path, passing=True):
-    """practice= for sleep: two task workspaces marked 'before' / 'after' (checks pass unless passing=False)."""
-    for name in ("before", "after"):
-        tasks.make_workspace(TASK, tmp_path / name)
-        if passing:
-            tasks.apply_reference(TASK, "s1", tmp_path / name)
-        (tmp_path / name / "MARK.txt").write_text(name, encoding="utf-8")
-    return {"task_id": TASK, "request": REAL, "ws_before": tmp_path / "before", "ws_after": tmp_path / "after",
-            "scratch": tmp_path / "scratch", "max_steps": 12}
-
-
-def tree(root):
-    return {p.relative_to(root).as_posix(): p.read_bytes() for p in Path(root).rglob("*") if p.is_file()}
-
-
-def practice_chat(refine=lines(SPECIFIC, LESSON), dream=dream_lines(*DREAMS), writes=(("notes.txt", "practice"),)):
-    """Sleep calls answered by instruction (any other tool-less prompt fails the test). A practice session writes
-    `writes` one file per step, then finishes; `writes` may be a function of (request, refined), where refined
-    means the session's memory holds the SPECIFIC rule."""
-    state = {}
-
-    def chat(messages, tools=None, *, max_tokens, seed=None, **kwargs):
-        chat.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens, "seed": seed})
-        usage = {"prompt_tokens": 50, "completion_tokens": 20}
-        if tools:
-            if not any(m["role"] == "assistant" for m in messages[2:]):
-                request = messages[1]["content"].partition(agent.MEMORY.format(memory=""))[0]
-                plan = writes(request, any(SPECIFIC[1] in m["content"] for m in messages)) if callable(writes) \
-                    else writes
-                state["queue"] = [("write_file", {"path": p, "content": c}) for p, c in plan]
-            name, args = state["queue"].pop(0) if state["queue"] else ("finish", {"summary": "done"})
-            return {"content": "", "tool_calls": [{"name": name, "arguments": args, "raw": json.dumps(args)}],
-                    "usage": usage, "seconds": 1.0, "finish_reason": "tool_calls"}
-        prompt = messages[0]["content"]
-        replies = {designs.EXTRACT_INSTRUCTION: lines(MILLIS), designs.MERGE_INSTRUCTION: lines(MILLIS, LESSON),
-                   designs.DREAM_INSTRUCTION: dream, designs.REFINE_INSTRUCTION: refine}
-        [content] = [reply for ending, reply in replies.items() if prompt.endswith(ending)]
-        return {"content": content, "tool_calls": [], "usage": usage, "seconds": 1.5, "finish_reason": "stop"}
-    chat.calls = []
-    return chat
-
-
-def scored(table):
-    """writes= for practice_chat: per (DREAMS index, refined) the score that session's added text should get."""
-    requests = [d["request"] for d in DREAMS]
-    return lambda request, refined: [("notes.txt", WRITTEN[table[requests.index(request), refined]])]
-
-
-@pytest.fixture
-def spy(monkeypatch):
-    """What every practice session received: its sandbox's MARK, request, memory, and the sandbox itself."""
-    real, seen = agent.run_session, []
-
-    def run_session(task_id, workspace, prompt, **kwargs):
-        mark = (Path(workspace) / "MARK.txt").read_text(encoding="utf-8")
-        seen.append({"mark": mark, "request": prompt, "memory": kwargs["memory"], "workspace": Path(workspace),
-                     "max_steps": kwargs["max_steps"], "seed": kwargs["seed"],
-                     "memory_at": kwargs.get("memory_at", "system"), "finish_gate": kwargs.get("finish_gate", False)})
-        return real(task_id, workspace, prompt, **kwargs)
-    monkeypatch.setattr(designs.agent, "run_session", run_session)
-    return seen
+def dream_reply(*dreams):
+    return json.dumps({"exercises": list(dreams)})
 
 
 def sleep(design, fake, practice, window=4096, reserve=700, seed=None):
@@ -558,29 +496,469 @@ def sleep(design, fake, practice, window=4096, reserve=700, seed=None):
                          practice=practice)
 
 
-@pytest.mark.parametrize("design", ["replay", "dreaming"])
-@pytest.mark.parametrize("options", [{}, {"memory_at": "request", "finish_gate": True},
-                                    {"memory_at": "tail", "finish_gate": True}])
-def test_practice_attempts_and_candidates_receive_placement_and_gate(tmp_path, spy, design, options):
-    practice = {**snapshots(tmp_path, passing=False), **options}
-    fake = practice_chat()
-    artifact, cost = sleep(design, fake, practice)
-    assert artifact["practice"][0]["refined"] and cost["practice_sessions"] == 4
-    placement, gate = options.get("memory_at", "system"), options.get("finish_gate", False)
-    assert [(s["memory_at"], s["finish_gate"]) for s in spy] == [(placement, gate)] * 4
+def test_dreams_clean_grounded_strings_and_keep_rejected_entries():
+    decision = "Always use aa bb cc dd ee and _MS for every future duration."
+    dream = {"decision": "  " + decision + "  ", "request": "  Make a timer.  ",
+             "must_add": [None, "", "x", "12", " 1., 2 ", "zz", "AA", "aa", "bb", "cc", "dd", "ee"],
+             "must_not_add": [7, "", "ab", "123", " 3., 4 ", "aa", "AAA", "BBB", "CCC", "DDD", "EEE"]}
+    [got] = designs._dreams(dream_reply(dream, {}, {"request": " "}, {"request": 3}), [decision])
+    assert got == {"request": "Make a timer.", "hypothetical": True, "decision": decision,
+                   "must_add": ["aa", "bb", "cc", "dd"], "must_not_add": ["AAA", "BBB", "CCC", "DDD"],
+                   "rejected": ""}
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "must_add": "_MS", "must_not_add": "_SECONDS"}), [DECISION])
+    assert got["must_add"] == ["_MS"] and got["must_not_add"] == ["_SECONDS"]
+
+
+@pytest.mark.parametrize("reply", ["junk", "[]", "{}", '{"exercises": {}}',
+                                   json.dumps(DREAMS), json.dumps(DREAMS[0]),
+                                   "```json\n" + dream_reply(*DREAMS) + "\n```",
+                                   dream_reply(*DREAMS) + "\n{}"])
+def test_dreams_require_one_object_with_an_exercises_list(reply):
+    assert designs._dreams(reply, [DECISION]) == []
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"decision": "Use _MS."}, "decision is not the user's words"),
+    ({"decision": "Always store future durations using _MS."}, "decision is not the user's words"),
+    ({"decision": None}, "decision is not the user's words"),
+    ({"must_add": ["not quoted", "1", "x"]}, "no grounded must_add"),
+    ({"request": "Add a timer using _ms."}, "request contains a check string"),
+    ({"request": "Add a timer using _seconds."}, "request contains a check string"),
+    ({"request": "Add `timer`."}, "request names an identifier or file"),
+    ({"request": "Add timer_value."}, "request names an identifier or file"),
+    ({"request": "Add timer_."}, "request names an identifier or file"),
+    *[({"request": "Edit folder/file." + ext}, "request names an identifier or file")
+      for ext in ("py", "json", "md", "txt", "toml", "yaml", "yml", "cfg", "ini")],
+    ({"decision": "bad", "must_add": [], "request": "Edit x.py with _MS."}, "decision is not the user's words"),
+    ({"must_add": [], "request": "Edit x.py."}, "no grounded must_add"),
+    ({"request": "Edit x.py with _MS."}, "request contains a check string"),
+])
+def test_dreams_reject_first_grounding_or_request_problem(changes, reason):
+    [got] = designs._dreams(dream_reply({**DREAMS[0], **changes}), [DECISION])
+    assert got["rejected"] == reason
+
+
+def test_dreams_match_decisions_across_odd_whitespace_but_ground_strings_exactly():
+    decision = "Store every\tduration in milliseconds\nwith the _MS suffix."
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "decision": decision}),
+                          ["Please do this: Store  every\r\nduration in milliseconds with the _MS suffix. Thanks."])
+    assert got["decision"] == decision and got["rejected"] == ""
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "decision": decision, "must_add": ["every duration"]}),
+                          [DECISION])
+    assert got["rejected"] == "no grounded must_add"
+
+
+@pytest.fixture
+def practice(tmp_path, monkeypatch):
+    task_dir = tmp_path / "tasks" / TASK
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.json").write_text(json.dumps({
+        "check_cmd": ["python checks/check.py"], "protected": ["checks", "absent"]}), encoding="utf-8")
+    monkeypatch.setattr(tasks, "TASKS_DIR", task_dir.parent)
+    for mark in ("before", "after"):
+        root = tmp_path / mark
+        (root / "checks").mkdir(parents=True)
+        (root / "checks" / "check.py").write_text(
+            "from pathlib import Path\nassert Path('ok.txt').read_text() == 'yes'\n", encoding="utf-8")
+        (root / "ok.txt").write_text("yes", encoding="utf-8")
+        (root / "MARK.txt").write_text(mark, encoding="utf-8")
+    return {"task_id": TASK, "request": REAL, "requests": [DECISION, REAL],
+            "ws_before": tmp_path / "before", "ws_after": tmp_path / "after",
+            "scratch": tmp_path / "scratch", "max_steps": 20}
+
+
+@pytest.fixture
+def spy(monkeypatch):
+    real, seen = agent.run_session, []
+
+    def run_session(task_id, workspace, prompt, **kwargs):
+        result = real(task_id, workspace, prompt, **kwargs)
+        seen.append({"workspace": Path(workspace), "request": prompt, **kwargs, "result": result})
+        return result
+    monkeypatch.setattr(agent, "run_session", run_session)
+    return seen
+
+
+def tree(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in Path(root).rglob("*") if p.is_file()
+            and not agent.SKIP_DIRS & set(p.relative_to(root).parts)}
+
+
+def practice_chat(dream=None, repair=None, writes=None):
+    state = {"queue": [], "attempt": 0}
+    dream = dream_reply(*DREAMS) if dream is None else dream
+    repair = json.dumps({"number": 1, "text": SPECIFIC[1]}) if repair is None else repair
+
+    def chat(messages, tools=None, **kwargs):
+        chat.calls.append({"messages": messages, "tools": tools, **kwargs})
+        content, calls = "", []
+        if tools is not None:
+            if not any(m["role"] == "assistant" for m in messages):
+                request = messages[1]["content"].partition(agent.MEMORY.format(memory=""))[0]
+                memory = "\n".join(m["content"] for m in messages)
+                plan = writes(request, memory, state["attempt"]) if callable(writes) else writes
+                plan = [("notes.txt", "POLL_MS = 1")] if plan is None else plan
+                state["attempt"] += 1
+                state["queue"] = []
+                for path, text in plan:
+                    state["queue"] += [("read_file", {"path": path}),
+                                       ("write_file", {"path": path, "content": text})]
+            name, args = state["queue"].pop(0) if state["queue"] else ("finish", {"summary": "done"})
+            calls = [{"name": name, "arguments": args, "raw": json.dumps(args)}]
+        else:
+            prompt = messages[0]["content"]
+            if prompt.endswith(designs.EXTRACT_INSTRUCTION):
+                content = lines(MILLIS)
+            elif prompt.endswith(designs.MERGE_INSTRUCTION):
+                content = lines(MILLIS, LESSON)
+            elif prompt.endswith(designs.DREAM_INSTRUCTION):
+                content = dream
+            else:
+                content = repair
+        return {"content": content, "tool_calls": calls, "usage": {"prompt_tokens": 50, "completion_tokens": 20},
+                "seconds": 1.5, "finish_reason": "tool_calls" if calls else "stop"}
+    chat.calls = []
+    return chat
+
+
+def instruction_calls(fake, instruction):
+    return [c for c in fake.calls if c["tools"] is None and c["messages"][0]["content"].endswith(instruction)]
+
+
+def assert_record(record):
+    assert set(record) == {"exercises", "dreams_offered", "dream_replies", "items_before", "edit", "candidate",
+                           "refined", "accepted", "reason"}
+    assert all(set(e) == {"request", "hypothetical", "decision", "must_add", "must_not_add", "score",
+                          "check_passed", "missing", "present", "scores2"} for e in record["exercises"])
+    assert all(set(d) == {"decision", "request", "must_add", "must_not_add", "rejected", "control_score"}
+               for d in record["dreams_offered"])
+
+
+def test_attempt_restores_protected_folders_before_check_and_added_text(practice, spy):
+    (practice["ws_before"] / "ok.txt").write_text("no", encoding="utf-8")
+    fake = practice_chat(repair='{"number": -1, "text": ""}', writes=[
+        ("checks/check.py", "# CHEAT_MS\n"), ("absent/cheat.txt", "CHEAT_MS")])
+    before = tree(practice["ws_before"])
+    artifact, cost = sleep("replay", fake, practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert all(e["score"] == 1 and not e["check_passed"] for e in record["exercises"])
+    assert tree(practice["ws_before"]) == before
+    assert len({s["workspace"] for s in spy}) == cost["practice_sessions"] == 5
     for session in spy:
-        lines = [json.loads(line) for line in session["workspace"].with_suffix(".jsonl").read_text(
-            encoding="utf-8").splitlines()]
-        gated = [e for e in lines if e["type"] == "result" and e["text"] == agent.GATE.format(memory=session["memory"])]
-        assert len(gated) == int(gate)
+        sandbox = session["workspace"]
+        assert sandbox != practice["ws_before"] and sandbox.is_relative_to(practice["scratch"])
+        assert tree(sandbox)["checks/check.py"] == before["checks/check.py"]
+        assert not (sandbox / "absent").exists()
+        assert designs._added(sandbox, practice["ws_before"]) == ""
+    prompt = instruction_calls(fake, designs.REPAIR_INSTRUCTION)[0]["messages"][0]["content"]
+    assert "CHEAT_MS" not in prompt and "WHAT THE AGENT ADDED:\n(nothing)" in prompt
 
 
-def instruction_prompts(fake, instruction):
-    return [p for p in prompts(fake) if p.endswith(instruction)]
+@pytest.mark.parametrize("options", [{}, {"memory_at": "tail", "finish_gate": True},
+                                    {"memory_at": "request", "finish_gate": True}])
+def test_controls_use_only_decision_and_practice_uses_design_placement(practice, spy, options):
+    practice.update(options)
+    artifact, cost = sleep("dreaming", practice_chat(), practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["reason"] == "all exercises passed" and not record["refined"]
+    assert cost["practice_sessions"] == 4 and len(spy) == 4
+    assert [s["memory"] for s in spy[:2]] == ["- USER DECISION: " + DECISION] * 2
+    assert [(s["memory_at"], s["finish_gate"]) for s in spy[:2]] == [("request", False)] * 2
+    assert [(s["memory_at"], s["finish_gate"]) for s in spy[2:]] == [
+        (options.get("memory_at", "system"), options.get("finish_gate", False))] * 2
+    assert all(s["memory"] == MEMORY for s in spy[2:])
+    assert [s["result"]["gated"] for s in spy] == [False, False] + [options.get("finish_gate", False)] * 2
+    assert all((s["workspace"] / "MARK.txt").read_text() == "after" for s in spy)
+    assert all(e["scores2"] is None for e in record["exercises"])
 
 
-def sleep_calls(fake):
-    return [c for c in fake.calls if c["tools"] is None]
+@pytest.mark.parametrize("scores, controls, verified", [
+    ([0, 0, 0, 0], [0, 0, None, None], [0, 1]),
+    ([1, 0, 0, 0], [1, 0, 0, None], [1, 2]),
+    ([1, 1, 1, 0], [1, 1, 1, None], []),
+    ([1, 1, 0, 0], [1, 1, 0, None], [2]),
+])
+def test_controls_verify_in_order_stop_at_two_or_three_and_never_fallback(practice, spy, scores, controls, verified):
+    dreams = [{**DREAMS[0], "request": f"Make timer number {i}."} for i in range(4)]
+    rejected = {**DREAMS[0], "request": "Edit bad.py."}
+    def writes(request, memory, attempt):
+        index = [d["request"] for d in dreams].index(request)
+        score = scores[index] if "USER DECISION:" in memory else 0
+        return [("notes.txt", WRITTEN[score])]
+    artifact, cost = sleep("dreaming", practice_chat(dream=dream_reply(rejected, *dreams), writes=writes), practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert [d["control_score"] for d in record["dreams_offered"]] == [None] + controls
+    assert [e["request"] for e in record["exercises"]] == [dreams[i]["request"] for i in verified]
+    assert cost["practice_sessions"] == sum(s is not None for s in controls) + len(verified)
+    assert record["reason"] == ("all exercises passed" if verified else "no verified dreams")
+    assert artifact["items"] == ITEMS and record["candidate"] is None and record["edit"] is None
+    assert not record["accepted"] and not record["refined"]
+    assert all(s["request"] != REAL for s in spy)
+
+
+@pytest.mark.parametrize("reply", ["not JSON", '{"exercises": []}', dream_reply({**DREAMS[0], "decision": "invented"})])
+def test_no_usable_dream_ends_without_attempt_or_fallback(practice, spy, reply):
+    artifact, cost = sleep("dreaming", practice_chat(dream=reply), practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["reason"] == "no verified dreams" and record["exercises"] == []
+    assert record["dream_replies"] == [reply] and record["candidate"] is None and record["edit"] is None
+    assert artifact["items"] == ITEMS and cost["practice_sessions"] == 0 and spy == []
+
+
+def test_generation_uses_archive_schema_budget_and_capped_raw_reply(practice):
+    practice["requests"] = ["old\nline " + "x" * 6000, DECISION]
+    fake = practice_chat(dream="z" * 3000)
+    artifact, _ = sleep("dreaming", fake, practice, window=1600, reserve=300)
+    [call] = instruction_calls(fake, designs.DREAM_INSTRUCTION)
+    prompt = call["messages"][0]["content"]
+    assert prompt.startswith("USER REQUESTS:\n1. old line xxx") and "RULES:\n" not in prompt
+    assert prompt.endswith("\n\n" + designs.DREAM_INSTRUCTION)
+    assert llm.estimate_tokens(prompt) <= 1600 - 300 - designs.FRAMING_TOKENS
+    assert len(prompt) < len(designs._archive(practice["requests"])) + len(designs.DREAM_INSTRUCTION)
+    assert call["response_format"] == designs._schema("exercises", {"exercises": {
+        "type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
+            "decision": {"type": "string"}, "request": {"type": "string"},
+            "must_add": {"type": "array", "items": {"type": "string"}},
+            "must_not_add": {"type": "array", "items": {"type": "string"}}},
+            "required": ["decision", "request", "must_add", "must_not_add"]}}}, ["exercises"])
+    assert artifact["practice"][0]["dream_replies"] == ["z" * 2000]
+
+
+@pytest.mark.parametrize("second, accepted", [([0, 0, 0], True), ([1, 0, 0], True),
+    ([0, 2, 0], False), ([2, 0, 0], False), ([0, 0, 1], False)])
+def test_repair_edits_one_rule_and_requires_both_confirmations_and_other_not_worse(practice, spy, second, accepted):
+    def writes(request, memory, attempt):
+        if "USER DECISION:" in memory:
+            score = 0
+        elif SPECIFIC[1] in memory:
+            score = second[attempt - 4]
+        else:
+            score = 2 if request == DREAMS[0]["request"] else 0
+        return [("notes.txt", WRITTEN[score])]
+    fake = practice_chat(writes=writes)
+    practice.update(memory_at="tail", finish_gate=True)
+    artifact, cost = sleep("dreaming", fake, practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["items_before"] == ITEMS and record["candidate"] == REFINED
+    assert record["edit"] == {"number": 1, "text": SPECIFIC[1]}
+    assert record["refined"] and record["accepted"] is accepted
+    assert record["reason"] == ("" if accepted else "not confirmed")
+    assert [e["score"] for e in record["exercises"]] == [2, 0]
+    assert [e["scores2"] for e in record["exercises"]] == [second[:2], second[2:]]
+    assert record["exercises"][0]["missing"] == ["_MS"] and record["exercises"][0]["present"] == ["_SECONDS"]
+    assert artifact["items"] == (REFINED if accepted else ITEMS) and cost["practice_sessions"] == 7
+    assert [s["request"] for s in spy[4:]] == [DREAMS[0]["request"]] * 2 + [DREAMS[1]["request"]]
+    assert all(s["memory"] == CANDIDATE and s["memory_at"] == "tail" and s["finish_gate"] for s in spy[4:])
+    [call] = instruction_calls(fake, designs.REPAIR_INSTRUCTION)
+    assert call["messages"][0]["content"] == (RULES + f"USER DECISION: {DECISION}\n\n"
+        f"REQUEST: {DREAMS[0]['request']}\n\nWHAT THE AGENT ADDED:\nPOLL_SECONDS = 1\n\nPROBLEMS:\n"
+        "The added text should contain '_MS' but does not\n"
+        "The added text contains '_SECONDS', which must not appear\n\n" + designs.REPAIR_INSTRUCTION)
+    assert call["response_format"] == designs._schema(
+        "edit", {"number": {"type": "integer"}, "text": {"type": "string"}}, ["number", "text"])
+    assert all(a is not b for a, b in zip(record["items_before"], artifact["items"]))
+
+
+@pytest.mark.parametrize("reply, edit, reason", [
+    ('{"number": -1, "text": ""}', {"number": -1, "text": ""}, "no edit"),
+    ("bad JSON", None, "no edit"), ('[]', None, "no edit"),
+    ('{"number": true, "text": "new"}', None, "no edit"),
+    ('{"number": "1", "text": "new"}', None, "no edit"),
+    ('{"number": 5, "text": "new"}', {"number": 5, "text": "new"}, "bad number"),
+    ('{"number": 1}', {"number": 1, "text": None}, "empty text"),
+    ('{"number": 1, "text": 7}', {"number": 1, "text": 7}, "empty text"),
+    ('{"number": 2, "text": "Use seconds."}', {"number": 2, "text": "Use seconds."}, "edit drops identifiers"),
+])
+def test_repair_no_edit_invalid_reply_and_refusal_leave_rules_unchanged(practice, spy, reply, edit, reason):
+    fake = practice_chat(repair=reply, writes=lambda r, m, i: [("notes.txt", WRITTEN[0 if i < 2 else 1])])
+    expected = ITEMS
+    if reason == "edit drops identifiers":
+        expected = [ITEMS[0], {"kind": "rule", "text": "Keep TIMEOUT_MS."}]
+        cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+        kept, record = designs._practise("dreaming", expected, practice, fake, 4096, 700, None, cost)
+        artifact = {"items": kept, "practice": [record]}
+    else:
+        artifact, cost = sleep("dreaming", fake, practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["edit"] == edit and record["reason"] == reason
+    assert record["candidate"] is None and not record["refined"] and not record["accepted"]
+    assert all(e["scores2"] is None for e in record["exercises"])
+    assert artifact["items"] == expected and len(spy) == cost["practice_sessions"] == 4
+
+
+@pytest.mark.parametrize("repair", [False, True])
+def test_replay_runs_five_real_requests_before_snapshot_and_repairs_once(practice, spy, repair):
+    if repair:
+        (practice["ws_before"] / "ok.txt").write_text("no", encoding="utf-8")
+    def writes(request, memory, attempt):
+        return [("ok.txt", "yes")] if SPECIFIC[1] in memory else [("notes.txt", "practice")]
+    fake = practice_chat(writes=writes)
+    artifact, cost = sleep("replay", fake, practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["dreams_offered"] == record["dream_replies"] == []
+    assert len(record["exercises"]) == 5 and cost["practice_sessions"] == (8 if repair else 5)
+    assert all(s["request"] == REAL and (s["workspace"] / "MARK.txt").read_text() == "before" for s in spy)
+    assert all(e["decision"] == REAL and not e["hypothetical"] and e["must_add"] == e["must_not_add"] == []
+               for e in record["exercises"])
+    assert [e["scores2"] for e in record["exercises"]] == ([[0, 0], [0], None, None, None] if repair else [None] * 5)
+    assert record["refined"] is repair and record["accepted"] is repair
+    assert record["reason"] == ("" if repair else "all exercises passed")
+    assert artifact["items"] == (REFINED if repair else ITEMS)
+    assert not instruction_calls(fake, designs.DREAM_INSTRUCTION)
+    assert len(instruction_calls(fake, designs.REPAIR_INSTRUCTION)) == int(repair)
+
+
+def test_last_failed_exercise_is_confirmed_twice_without_a_next_exercise(practice, spy):
+    def writes(request, memory, attempt):
+        score = int(attempt == 3)
+        return [("notes.txt", WRITTEN[score])]
+    artifact, cost = sleep("dreaming", practice_chat(writes=writes), practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["accepted"] and [e["scores2"] for e in record["exercises"]] == [None, [0, 0]]
+    assert cost["practice_sessions"] == 6 and len(spy) == 6
+
+
+@pytest.mark.parametrize("design", ["dreaming", "replay"])
+def test_practice_cost_seeds_snapshot_and_record_copy(practice, spy, design):
+    if design == "replay":
+        (practice["ws_before"] / "ok.txt").write_text("no", encoding="utf-8")
+    before, after = tree(practice["ws_before"]), tree(practice["ws_after"])
+    def writes(request, memory, attempt):
+        if design == "replay":
+            return [("ok.txt", "yes")] if SPECIFIC[1] in memory else []
+        score = 0 if "USER DECISION:" in memory or SPECIFIC[1] in memory else 1
+        return [("notes.txt", WRITTEN[score])]
+    fake = practice_chat(writes=writes)
+    artifact, cost = sleep(design, fake, practice, seed=1000)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert cost["practice_sessions"] == len(spy) == (7 if design == "dreaming" else 8)
+    offline = [c for c in fake.calls if c["tools"] is None]
+    assert cost["calls"] == len(offline) == (4 if design == "dreaming" else 3)
+    assert cost["prompt_tokens"] == 50 * len(fake.calls) and cost["completion_tokens"] == 20 * len(fake.calls)
+    assert cost["seconds"] == 1.5 * len(offline) + sum(s["result"]["seconds"] for s in spy)
+    seeds = [c["seed"] for c in offline[2:]]
+    seeds += [s["seed"] + i for s in spy for i in range(1, s["max_steps"] + 1)]
+    assert len(seeds) == len(set(seeds)) and all(1000 < seed < 2000 for seed in seeds)
+    assert tree(practice["ws_before"]) == before and tree(practice["ws_after"]) == after
+    artifact["items"][1]["text"] = "changed later"
+    assert record["items_before"] == ITEMS
+    assert "USER DECISION" not in designs.inject(design, artifact)
+
+
+def test_contamination_includes_offered_unverified_requests_and_only_hypothetical_exercises():
+    log = [{"exercises": [{"request": "Use REAL_NAME", "hypothetical": False},
+                           {"request": "Use DREAM_NAME and WAKE_NAME", "hypothetical": True}],
+            "dreams_offered": [{"request": "Edit `offered.py` and OFFERED_NAME"}]}]
+    memory = "REAL_NAME DREAM_NAME WAKE_NAME offered.py OFFERED_NAME"
+    assert designs.contamination(memory, log, [[{"type": "user", "text": "WAKE_NAME"}]]) == [
+        "DREAM_NAME", "OFFERED_NAME", "offered.py"]
+    assert designs.contamination(memory, [{"exercises": []}], []) == []
+
+
+def test_dreams_preserve_check_whitespace_lengths_and_substring_exclusions():
+    decision = "Use aa and _MS and keep every future duration consistent."
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "decision": decision,
+        "must_add": [" _MS ", "aa", "_M", "\t_MS\t"],
+        "must_not_add": ["_MS", " _MS ", "aa", "bad", "  odd  "]}), [decision])
+    assert got["must_add"] == [" _MS ", "aa", "_M"]
+    assert got["must_not_add"] == ["bad", "  odd  "] and got["rejected"] == ""
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "decision": "x" * 20, "must_add": ["xx"]}), ["x" * 20])
+    assert got["rejected"] == ""
+    [got] = designs._dreams(dream_reply({**DREAMS[0], "decision": "x" * 19, "must_add": ["xx"]}), ["x" * 19])
+    assert got["rejected"] == "decision is not the user's words"
+
+
+def test_attempt_score_sums_check_failure_missing_and_forbidden_strings(practice):
+    dream = {**DREAMS[0], "must_add": ["_MS", "milliseconds"]}
+    def writes(request, memory, attempt):
+        return [("ok.txt", "yes" if "USER DECISION:" in memory else "no"),
+                ("notes.txt", "POLL_MS milliseconds" if "USER DECISION:" in memory else "POLL_SECONDS")]
+    artifact, _ = sleep("dreaming", practice_chat(dream=dream_reply(dream), writes=writes,
+                                                repair='{"number": -1, "text": ""}'), practice)
+    [record] = artifact["practice"]
+    assert_record(record)
+    assert record["dreams_offered"][0]["control_score"] == 0
+    [exercise] = record["exercises"]
+    assert (exercise["score"], exercise["check_passed"], exercise["missing"], exercise["present"]) == (
+        4, False, ["_MS", "milliseconds"], ["_SECONDS"])
+
+
+@pytest.mark.parametrize("room, added_kept, output_kept", [(1000, True, True), (400, False, False),
+                                                         (40, False, False), (0, False, False)])
+def test_repair_prompt_caps_and_fits_added_then_output_then_request(room, added_kept, output_kept):
+    exercise = {**DREAMS[0], "request": "request " * 150}
+    result = {"added": "a" * 1200, "output": "HEAD" + "o" * 1000 + "TAIL", "passed": False,
+              "missing": ["_MS"], "present": ["_SECONDS"]}
+    empty = {**result, "added": "", "output": ""}
+    minimum = designs._repair_prompt(ITEMS, {**exercise, "request": ""}, empty, 10000)
+    budget = llm.estimate_tokens(minimum) + room
+    prompt = designs._repair_prompt(ITEMS, exercise, result, budget)
+    assert llm.estimate_tokens(prompt) <= budget
+    assert f"USER DECISION: {DECISION}" in prompt and prompt.endswith(designs.REPAIR_INSTRUCTION)
+    added = prompt.split("WHAT THE AGENT ADDED:\n")[1].split("\n\nPROBLEMS:")[0]
+    output = prompt.split("The project check failed: ")[1].split("\nThe added text")[0]
+    request = prompt.split("\n\nREQUEST: ")[1].split("\n\nWHAT THE AGENT ADDED:")[0]
+    if added_kept:
+        assert added == "a" * designs.ADDED_CAP and output == result["output"][-designs.CHECK_TAIL:]
+    else:
+        assert added == "(nothing)"
+    if output_kept:
+        assert output == result["output"][-designs.CHECK_TAIL:]
+    else:
+        assert len(output) < designs.CHECK_TAIL
+    if output != result["output"][-designs.CHECK_TAIL:]:
+        assert added == "(nothing)" and result["output"][-designs.CHECK_TAIL:].startswith(output)
+    if request != exercise["request"]:
+        assert added == "(nothing)" and output == "" and exercise["request"].startswith(request)
+
+
+def test_practice_without_seed_and_second_sleep_keep_only_one_record(practice, spy):
+    fake = practice_chat()
+    first, _ = sleep("replay", fake, practice)
+    second, _ = designs.sleep("replay", first, session_events(2), chat=fake, window=4096, reserve=700,
+                              practice=practice)
+    assert len(second["practice"]) == 1 and second["practice"][0]["items_before"] == ITEMS
+    merges = instruction_calls(fake, designs.MERGE_INSTRUCTION)
+    assert merges[1]["messages"][0]["content"].startswith(f"CURRENT memory:\n{lines(MILLIS, LESSON)}")
+    assert all(call["seed"] is None for call in fake.calls) and all(s["seed"] is None for s in spy)
+    artifact = {"items": ITEMS, "practice": [{"request": "SECRET_DREAM"}], "requests": ["SECRET_ARCHIVE"]}
+    assert designs.inject("dreaming", artifact) == designs.inject("replay", artifact) == MEMORY
+
+
+def test_practice_constants_and_instruction_texts_are_pinned():
+    assert (designs.EXERCISES, designs.EXPECT_CAP, designs.CONTROL_CAP, designs.CONFIRM,
+            designs.REPLAY_ATTEMPTS, designs.REPLY_CAP, designs.DECISION_MIN) == (2, 4, 3, 2, 5, 2000, 20)
+    assert not hasattr(designs, "REFINE_INSTRUCTION")
+    assert designs.DREAM_INSTRUCTION == (
+        "Above are the user's requests on this project, word for word, oldest first. Some of them contain standing "
+        "decisions: rules the user wants followed in all future work (a naming, format, unit or process policy), not "
+        "just in that one task. Find the standing decisions that no automatic check would enforce.\n"
+        "Write up to 4 practice exercises. Each exercise tests ONE standing decision:\n"
+        "- \"decision\": the user's sentence that states it, copied character for character from the requests above.\n"
+        "- \"request\": a small new feature request of the kind this user makes, to which the decision clearly "
+        "applies. Write it the way a teammate who never saw the decision would: plain everyday words, in the old or "
+        "everyday terms, nothing about how to store or name things, no file names, no setting names, no suffixes.\n"
+        "- \"must_add\": 1 or 2 short strings copied character for character from the decision (for example a "
+        "required suffix) that will appear in the text added to the project if the decision is followed.\n"
+        "- \"must_not_add\": short strings that would appear only if the decision were ignored. Never a whole "
+        "setting name, never a number.\n"
+        "If there is no standing decision, return an empty list. The exercises are hypothetical.")
+    assert designs.REPAIR_INSTRUCTION == (
+        "An agent that was given the RULES above got the REQUEST and broke a standing decision of the user. The "
+        "decision, in the user's own words, is quoted above. Change the rules so that an agent reading them follows "
+        "the decision in requests like this one. Edit exactly ONE rule: give its number, or 0 to add a new rule, and "
+        "the full new text of that rule (at most 35 words). State the decision as a general instruction for all "
+        "future work, keep the user's exact terms (names, suffixes, units), and say what to do when a request is "
+        "phrased in other terms. Do not mention the practice request: it was hypothetical.")
 
 
 def test_added_text_is_the_new_lines_of_changed_files_and_all_lines_of_new_files(tmp_path):
@@ -598,189 +976,6 @@ def test_added_text_is_the_new_lines_of_changed_files_and_all_lines_of_new_files
         (sandbox / skipped / "junk.txt").write_text("SKIPPED_MS\n", encoding="utf-8")
     assert designs._added(sandbox, snapshot) == "first\nbad  byte\nNEW_MS = 5"
     assert designs._added(snapshot, snapshot) == ""
-
-
-def test_replay_practises_the_real_request_twice_on_copies_of_the_snapshot_before_without_expectations(
-        tmp_path, spy):
-    practice = snapshots(tmp_path)
-    fake = practice_chat()
-    artifact, _ = sleep("replay", fake, practice)
-    assert [(s["mark"], s["request"]) for s in spy] == [("before", REAL)] * 2
-    assert all(s["memory"] == MEMORY and s["max_steps"] == 12 for s in spy)
-    sandboxes = [s["workspace"] for s in spy]
-    assert len(set(sandboxes)) == 2 and all(p.is_relative_to(practice["scratch"]) for p in sandboxes)
-    [record] = artifact["practice"]
-    assert [(e["request"], e["hypothetical"], e["must_add"], e["must_not_add"]) for e in record["exercises"]] == [
-        (REAL, False, [], [])] * 2
-    assert len(sleep_calls(fake)) == 2  # extract + merge: no dream, no refine, no review
-
-
-def test_dreaming_asks_once_for_exercises_with_the_rules_and_the_real_request_and_practises_them_after(
-        tmp_path, spy):
-    fake = practice_chat()
-    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
-    assert [(s["mark"], s["request"]) for s in spy] == [("after", d["request"]) for d in DREAMS] * 2  # + refined
-    assert [{k: e[k] for k in ("request", "must_add", "must_not_add")} for e in artifact["practice"][0]["exercises"]
-            ] == DREAMS
-    assert all(e["hypothetical"] for e in artifact["practice"][0]["exercises"])
-    [dream] = instruction_prompts(fake, designs.DREAM_INSTRUCTION)
-    assert dream == (RULES + f"An example of what users ask on this project:\n{REAL}\n\n"
-                     + designs.DREAM_INSTRUCTION)
-
-
-GOOD = {"request": "Add a poll interval of 9 seconds.", "must_add": ["_MS"], "must_not_add": []}
-
-
-@pytest.mark.parametrize("reply, expected", [
-    ("Sure!\n" + dream_lines(GOOD) + "\n{broken\n" + json.dumps({"request": "  ", "must_add": ["_MS"]}),
-     [GOOD, None]),
-    ("I cannot invent requests.", [None, None]),
-    (dream_lines({"request": "no checks"}, {"request": "blank checks", "must_add": ["  ", ""]},
-                 {"request": "not a list", "must_add": 7}), [None, None]),
-    ("```json\n" + json.dumps([GOOD, {**GOOD, "request": "second"}, {**GOOD, "request": "third"}]) + "\n```",
-     [GOOD, {**GOOD, "request": "second"}]),
-    (dream_lines({"request": "  lenient  ", "must_add": " _MS ", "must_not_add": [" a", "", 3, "b", "c", "d", "e"]}),
-     [{"request": "lenient", "must_add": ["_MS"], "must_not_add": ["a", "b", "c", "d"]}, None]),
-])
-def test_dreams_without_a_request_and_a_must_add_string_fall_back_to_the_real_request(tmp_path, spy, reply,
-                                                                                       expected):
-    artifact, _ = sleep("dreaming", practice_chat(dream=reply), snapshots(tmp_path))
-    plain = {"request": REAL, "must_add": [], "must_not_add": []}
-    got = [{k: e[k] for k in ("request", "hypothetical", "must_add", "must_not_add")}
-           for e in artifact["practice"][0]["exercises"]]
-    assert got == [{**plain, "hypothetical": False} if d is None else {**d, "hypothetical": True} for d in expected]
-    assert [(s["mark"], s["request"]) for s in spy[:2]] == [("after", e["request"]) for e in got]
-
-
-def test_score_counts_a_failed_check_missing_must_add_and_present_must_not_add_strings(tmp_path, spy):
-    dream = {"request": "Add a poll interval.", "must_add": ["_MS", "5000", "POLL"], "must_not_add": ["_SECONDS", "x!"]}
-    fake = practice_chat(dream=dream_lines(dream, GOOD), writes=[("notes.txt", "POLL_SECONDS = 5")])
-    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path, passing=False))
-    first, second = artifact["practice"][0]["exercises"]
-    assert (first["score"], first["check_passed"]) == (1 + 2 + 1, False)  # check, _MS and 5000, _SECONDS
-    assert (second["score"], second["check_passed"]) == (1 + 1, False)  # check, _MS
-
-
-def test_scores_of_zero_make_no_refine_call_and_run_exactly_two_sessions_with_this_log(tmp_path, spy):
-    fake = practice_chat()
-    artifact, cost = sleep("replay", fake, snapshots(tmp_path))
-    assert not instruction_prompts(fake, designs.REFINE_INSTRUCTION) and len(spy) == 2
-    assert cost["practice_sessions"] == 2 and cost["calls"] == 2
-    entry = {"request": REAL, "hypothetical": False, "must_add": [], "must_not_add": [], "score": 0, "score2": None,
-             "check_passed": True, "check_passed2": None, "missing": [], "present": [], "missing2": None,
-             "present2": None}
-    assert artifact == {"items": ITEMS, "practice": [{"exercises": [entry, entry], "refined": False,
-                                                      "accepted": False, "items_before": ITEMS, "candidate": None}]}
-
-
-@pytest.mark.parametrize("design", ["replay", "dreaming"])
-def test_practice_record_without_failures_keeps_a_copy_and_no_candidate(tmp_path, design):
-    items = [item.copy() for item in ITEMS]
-    cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
-    fake = practice_chat(writes=[("notes.txt", "POLL_MS = 1")])
-    kept, record = designs._practise(design, items, snapshots(tmp_path), fake, 4096, 700, None, cost)
-    assert kept is items and record["items_before"] == ITEMS
-    assert record["items_before"] is not items
-    assert all(before is not original for before, original in zip(record["items_before"], items))
-    assert record["candidate"] is None and not record["refined"] and not record["accepted"]
-    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
-        ([], [], None, None)] * 2
-    items[0]["text"] = "changed after practice"
-    items.append({"kind": "rule", "text": "added after practice"})
-    assert record["items_before"] == ITEMS
-
-
-def test_practice_record_keeps_the_capped_parsed_accepted_candidate_and_both_attempts(tmp_path, spy):
-    extra = [("rule", f"extra {i}") for i in range(8)]
-    fake = practice_chat(refine="junk\n" + lines(SPECIFIC, LESSON, *extra),
-                         writes=scored({(0, False): 2, (1, False): 0, (0, True): 0, (1, True): 0}))
-    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
-    [record] = artifact["practice"]
-    expected = REFINED + [{"kind": kind, "text": text} for kind, text in extra[:6]]
-    assert record["items_before"] == ITEMS and record["candidate"] == expected
-    assert record["refined"] and record["accepted"] and artifact["items"] == expected
-    assert [s["memory"] for s in spy[2:]] == [designs.inject("consolidated", {"items": expected})] * 2
-    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
-        (["_MS"], ["_SECONDS"], [], []), ([], [], [], [])]
-
-
-@pytest.mark.parametrize("candidate", [REFINED, REFINED[:1], []])
-def test_practice_record_keeps_rejected_candidates_including_empty_and_both_attempts(tmp_path, spy, candidate):
-    fake = practice_chat(refine=json.dumps(candidate), writes=[("notes.txt", "POLL_SECONDS = 1")])
-    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
-    [record] = artifact["practice"]
-    assert record["items_before"] == ITEMS and record["candidate"] == candidate
-    assert record["refined"] and not record["accepted"] and artifact["items"] == ITEMS
-    assert [s["memory"] for s in spy[2:]] == [designs.inject("consolidated", {"items": candidate})] * 2
-    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
-        (["_MS"], ["_SECONDS"], ["_MS"], ["_SECONDS"])] * 2
-
-
-def test_a_failing_exercise_triggers_one_refine_and_two_more_sessions_with_the_candidate(tmp_path, spy):
-    fake = practice_chat(writes=scored({(0, False): 2, (1, False): 0, (0, True): 0, (1, True): 0}))
-    artifact, cost = sleep("dreaming", fake, snapshots(tmp_path))
-    assert len(instruction_prompts(fake, designs.REFINE_INSTRUCTION)) == 1 and cost["practice_sessions"] == 4
-    assert [(s["request"], s["memory"]) for s in spy] == [(d["request"], m) for m in (MEMORY, CANDIDATE)
-                                                          for d in DREAMS]
-    assert len({s["workspace"] for s in spy}) == 4
-    record = artifact["practice"][0]
-    assert [(e["score"], e["score2"], e["check_passed"], e["check_passed2"]) for e in record["exercises"]] == [
-        (2, 0, True, True), (0, 0, True, True)]
-    assert (record["refined"], record["accepted"]) == (True, True) and artifact["items"] == REFINED
-
-
-@pytest.mark.parametrize("table, accepted", [
-    ({(0, False): 2, (1, False): 0, (0, True): 0, (1, True): 0}, True),   # failed one improves, other holds
-    ({(0, False): 2, (1, False): 1, (0, True): 1, (1, True): 0}, True),   # both improve
-    ({(0, False): 2, (1, False): 0, (0, True): 0, (1, True): 1}, False),  # the other one gets worse
-    ({(0, False): 1, (1, False): 1, (0, True): 1, (1, True): 1}, False),  # the sum stays equal
-    ({(0, False): 0, (1, False): 2, (0, True): 1, (1, True): 0}, False),  # the first gets worse
-])
-def test_a_candidate_is_accepted_only_if_no_exercise_gets_worse_and_the_sum_drops(tmp_path, spy, table, accepted):
-    artifact, _ = sleep("dreaming", practice_chat(writes=scored(table)), snapshots(tmp_path))
-    record = artifact["practice"][0]
-    assert [(e["score"], e["score2"]) for e in record["exercises"]] == [(table[0, False], table[0, True]),
-                                                                        (table[1, False], table[1, True])]
-    assert record["refined"] and record["accepted"] is accepted
-    assert artifact["items"] == (REFINED if accepted else ITEMS)
-
-
-def test_a_candidate_with_fewer_items_is_rejected_even_if_it_scores_better(tmp_path, spy):
-    fake = practice_chat(refine=lines(SPECIFIC), writes=scored({(0, False): 2, (1, False): 2,
-                                                                (0, True): 0, (1, True): 0}))
-    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
-    record = artifact["practice"][0]
-    assert [e["score2"] for e in record["exercises"]] == [0, 0] and not record["accepted"]
-    assert artifact["items"] == ITEMS
-
-
-def test_refine_prompt_is_built_from_the_first_failing_exercise_with_code_generated_problems(tmp_path, spy):
-    fake = practice_chat(writes=scored({(0, False): 0, (1, False): 2, (0, True): 0, (1, True): 0}))
-    sleep("dreaming", fake, snapshots(tmp_path))
-    [refine] = instruction_prompts(fake, designs.REFINE_INSTRUCTION)
-    assert refine.startswith(RULES + f"REQUEST: {DREAMS[1]['request']}\n\nWHAT THE AGENT ADDED:\nPOLL_SECONDS = 1\n")
-    assert refine.endswith("\n\nPROBLEMS:\nThe added text should contain '_MS' but does not\n"
-                           "The added text contains '_SECONDS', which must not appear\n\n" + designs.REFINE_INSTRUCTION)
-    assert len(sleep_calls(fake)) == 2 + 1 + 1  # consolidation, dream, refine: nothing else asks the model
-    assert not any(p.startswith("USER REQUESTS:\n") for p in prompts(fake))
-
-
-def test_refine_prompt_reports_a_failed_check_with_the_end_of_its_output(tmp_path, spy):
-    fake = practice_chat()
-    sleep("replay", fake, snapshots(tmp_path, passing=False))
-    [refine] = instruction_prompts(fake, designs.REFINE_INSTRUCTION)
-    assert refine.startswith(RULES + f"REQUEST: {REAL}\n\nWHAT THE AGENT ADDED:\npractice\n")
-    problems = refine.split("\n\nPROBLEMS:\n")[1].removesuffix("\n\n" + designs.REFINE_INSTRUCTION)
-    assert problems.startswith("The project check failed: ") and problems.endswith("checks FAILED (exit 1)")
-    assert len(problems) == len("The project check failed: ") + 300
-
-
-def test_added_text_in_the_refine_prompt_is_capped(tmp_path, spy):
-    fake = practice_chat(writes=[(f"f{i}.txt", str(i) * 300) for i in range(4)])
-    sleep("replay", fake, snapshots(tmp_path, passing=False))
-    [refine] = instruction_prompts(fake, designs.REFINE_INSTRUCTION)
-    added = refine.split("WHAT THE AGENT ADDED:\n")[1].split("\n\nPROBLEMS:\n")[0]
-    assert added == ("0" * 300 + "\n" + "1" * 300 + "\n" + "2" * 300)[:800]
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -805,103 +1000,6 @@ def test_merged_items_lose_their_long_replaces_tails(tmp_path):
     artifact, _ = designs.sleep("consolidated", None, session_events(2), window=4096, reserve=700,
                                 chat=memory_chat(lines(MILLIS), lines(("rule", "Store durations in _MS." + tail))))
     assert artifact == {"items": [{"kind": "rule", "text": "Store durations in _MS."}]}
-
-
-def test_practice_never_touches_the_snapshots(tmp_path, spy):
-    practice = snapshots(tmp_path)
-    before, after = tree(practice["ws_before"]), tree(practice["ws_after"])
-    for design in ("replay", "dreaming"):
-        sleep(design, practice_chat(writes=[("notes.txt", "x"), ("src/new.py", "y = 1\n")]), practice)
-    assert tree(practice["ws_before"]) == before and tree(practice["ws_after"]) == after
-    assert len(spy) == 2 + 4 and all((s["workspace"] / "src" / "new.py").exists() for s in spy)
-
-
-@pytest.mark.parametrize("design, dream_calls", [("replay", 0), ("dreaming", 1)])
-def test_practice_cost_sums_every_call_and_practice_session(tmp_path, spy, design, dream_calls):
-    fake = practice_chat()
-    _, cost = sleep(design, fake, snapshots(tmp_path, passing=False))
-    calls = sleep_calls(fake)
-    assert len(calls) == 2 + dream_calls + 1 and cost["practice_sessions"] == 4  # consolidation, dream, refine
-    assert cost["calls"] == len(calls) and len(fake.calls) - len(calls) == 4 * 2  # write + finish per session
-    assert cost["prompt_tokens"] == 50 * len(fake.calls) and cost["completion_tokens"] == 20 * len(fake.calls)
-    assert cost["seconds"] >= 1.5 * len(calls)
-
-
-def test_every_practice_prompt_fits_the_window(tmp_path, spy):
-    window, reserve = 1300, 300
-    practice = snapshots(tmp_path, passing=False)
-    practice["request"] = "Add a setting. " + "r" * 600
-    dreams = [{"request": c * 600, "must_add": [c * 100] * 4, "must_not_add": ["_S" + c * 100] * 4} for c in "de"]
-    fake = practice_chat(writes=[(f"f{i}.txt", str(i) * 600) for i in range(4)], dream=dream_lines(*dreams),
-                         refine=lines(*[("rule", f"rule {i} " + "z" * 100) for i in range(8)]))
-    for design in ("replay", "dreaming"):
-        sleep(design, fake, practice, window=window, reserve=reserve)
-    refines = instruction_prompts(fake, designs.REFINE_INSTRUCTION)
-    assert len(refines) == 2 and len(instruction_prompts(fake, designs.DREAM_INSTRUCTION)) == 1
-    shown = [p.split("WHAT THE AGENT ADDED:\n")[1].split("\n\nPROBLEMS:\n")[0] for p in refines]
-    assert all(s.startswith("000") for s in shown) and min(map(len, shown)) < designs.ADDED_CAP  # trimmed to fit
-    starts = [c for c in fake.calls if c["tools"] and len(c["messages"]) == 2]  # later steps: the agent's own ratio
-    assert len(starts) == 8
-    for call in sleep_calls(fake) + starts:
-        size = (agent.estimate_prompt(call["messages"]) if call["tools"]
-                else llm.estimate_tokens(call["messages"][0]["content"]))
-        assert size <= window - reserve and call["max_tokens"] == reserve
-
-
-def test_practice_seeds_are_distinct_and_stay_within_this_sleeps_hundred(tmp_path, spy):
-    fake = practice_chat()
-    sleep("dreaming", fake, snapshots(tmp_path, passing=False), seed=1000)
-    consolidation = 2
-    seeds = [c["seed"] for c in sleep_calls(fake)[consolidation:]]
-    seeds += [s["seed"] + step for s in spy for step in range(1, s["max_steps"] + 1)]
-    assert len(spy) == 4 and len(seeds) == 2 + 4 * 12
-    assert len(set(seeds)) == len(seeds) and all(1000 < s < 1100 for s in seeds)
-    fake = practice_chat()
-    sleep("dreaming", fake, snapshots(tmp_path / "again"))
-    assert {c["seed"] for c in fake.calls} == {None}
-
-
-def test_dreaming_and_replay_inject_only_their_items():
-    artifact = {"items": [{"kind": "rule", "text": MILLIS[1]}],
-                "practice": [{"exercises": [{"request": "SECRET_DREAM_NAME"}], "refined": False, "accepted": False}]}
-    for design in ("dreaming", "replay"):
-        assert designs.inject(design, artifact) == f"- RULE: {MILLIS[1]}" and designs.inject(design, None) == ""
-
-
-def test_second_practice_sleep_consolidates_into_the_first_items(tmp_path, spy):
-    fake = practice_chat()
-    first, _ = sleep("replay", fake, snapshots(tmp_path))
-    second, _ = designs.sleep("replay", first, session_events(2), chat=fake, window=4096, reserve=700,
-                              practice=snapshots(tmp_path / "s2"))
-    merges = instruction_prompts(fake, designs.MERGE_INSTRUCTION)
-    assert len(merges) == 2 and merges[1].startswith(f"CURRENT memory:\n{lines(MILLIS, LESSON)}\n\nNEW items:\n")
-    assert len(second["practice"]) == 1  # each sleep returns only its own record
-
-
-def test_contamination_lists_identifiers_that_only_a_dream_put_into_memory():
-    memory = ("- RULE: name delays like `RETRY_DELAY_MS`; TIMEOUT_MS stays.\n- RULE: CACHE_TTL_MS = 5000; "
-              "BACKOFF_MS too; LOG_LEVEL_NAME; `abcd`")
-
-    def record(*exercises):
-        return {"exercises": [{"request": r, "hypothetical": h} for r, h in exercises], "refined": False,
-                "accepted": False}
-    log = [record(("Add CACHE_TTL_MS, `RETRY_DELAY_MS` and SHORT.", True), ("Set LOG_LEVEL_NAME.", False)),
-           record(("Add TIMEOUT_MS, BACKOFF_MS and `abcd`.", True))]
-    wake = [[{"type": "user", "text": "Rename TIMEOUT_S to TIMEOUT_MS."}],
-            [{"type": "user", "text": "s2"}, {"type": "result", "step": 1, "text": "BACKOFF_MS = 1"}]]
-    assert designs.contamination(memory, log, wake) == ["CACHE_TTL_MS", "RETRY_DELAY_MS"]
-    assert designs.contamination(memory, [], wake) == []
-
-
-def test_practice_instruction_texts():
-    assert designs.EXERCISES == 2
-    assert designs.DREAM_INSTRUCTION.startswith("Write 2 practice exercises that test whether an agent applies")
-    assert "without naming files, setting names, suffixes or conventions" in designs.DREAM_INSTRUCTION
-    assert designs.DREAM_INSTRUCTION.endswith(
-        'one object per line: {"request": "...", "must_add": ["..."], "must_not_add": ["..."]}')
-    assert designs.REFINE_INSTRUCTION.startswith("An agent that was given the rules above got this request")
-    assert "Never reverse or weaken a rule." in designs.REFINE_INSTRUCTION
-    assert designs.REFINE_INSTRUCTION.endswith('{"kind": "rule" or "lesson", "text": "..."}')
 
 
 # --- review ---------------------------------------------------------------------------------------
