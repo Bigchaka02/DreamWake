@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 SEED_STRIDE, ATTEMPT_STRIDE, SESSION_STRIDE = 100_000, 1_000, 100  # chat seed = sum of these + step
 FINAL_OFFSET = 99_000  # same final-session seeds for every design (common random numbers)
 SLEEP_OFFSET = 98_000  # likewise for the sleep calls; stays clear of the wake and final seeds
-PRACTICE_STEPS = 12  # step cap of one practice session during the dreaming / replay sleep
+PRACTICE_STEPS = 20  # step cap of one practice session during the dreaming / replay sleep (same as a real session)
 
 
 def _git(*args):

@@ -28,8 +28,8 @@ MERGE_INSTRUCTION = (
     "memory and output the complete updated memory as JSON lines, one object per line: "
     "{\"kind\": \"rule\" or \"lesson\", \"text\": \"...\"}.\n"
     "- Keep every current item that is still true.\n"
-    "- If a new item changes or contradicts a current item, keep only the newer one and end it with "
-    "'(replaces: <the old rule in a few words>)'.\n"
+    "- If a new item contradicts a current item, keep only the newer one and end it with "
+    "'(replaces: <the old rule in at most 5 words>)'. Never copy an old item's text into a new one.\n"
     "- Merge duplicates. Keep each item a general instruction, at most 35 words. At most 8 items. "
     "Output only the JSON lines.")
 DREAM_INSTRUCTION = (
