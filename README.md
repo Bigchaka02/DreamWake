@@ -66,6 +66,8 @@ Each run writes `runs/<name>/results.jsonl`, every session's step log, and a
 
 ## Layout
 
+- `1_PROJECT_OVERVIEW.md`, `2_PROJECT_LOG.md`, `3_PROJECT_STATUS_AND_TODO.md`
+  — the design in full, what was done in order, and what is open.
 - `dreamwake/` — agent loop (`agent.py`), designs (`designs.py`), experiment
   runner (`run.py`), task loader and evaluator (`tasks.py`), LM Studio client
   (`llm.py`).
@@ -73,5 +75,6 @@ Each run writes `runs/<name>/results.jsonl`, every session's step log, and a
   reference states for each task.
 - `docs/design/001-experiment-protocol.md` — the protocol and its guardrails.
 - `docs/notes/` — one note per experiment: question, result, decision.
+- `docs/runs-index.md` — which local run folder backs which number.
 - `docs/engineering-rules.md` — working rules distilled from the superpowers
   and ponytail repositories.

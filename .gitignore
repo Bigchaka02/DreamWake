@@ -5,5 +5,8 @@ __pycache__/
 # bulky / local-only artifacts (metadata to reproduce lives in the repo)
 runs/
 .refs/
+# local working documents: how this PC and the delegation are set up
+4_ORCHESTRATOR_GUIDE.md
+5_RESUME.md
 *.gguf
 *.safetensors
