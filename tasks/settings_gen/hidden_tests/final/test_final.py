@@ -1,5 +1,5 @@
 """Hidden checks after the final session. Run with cwd = workspace copy, after tools/gen.py.
-DW_BASELINE_KEYS holds the template keys present when the final session started."""
+DW_BASELINE_DIR is a copy of the workspace as it was when the final session started."""
 import json
 import os
 import re
@@ -10,7 +10,7 @@ from pathlib import Path
 
 def new_keys():
     template = json.loads(Path("settings.tmpl.json").read_text(encoding="utf-8"))
-    baseline = json.loads(os.environ["DW_BASELINE_KEYS"])
+    baseline = json.loads((Path(os.environ["DW_BASELINE_DIR"]) / "settings.tmpl.json").read_text(encoding="utf-8"))
     return {key: entry for key, entry in template.items() if key not in baseline}
 
 

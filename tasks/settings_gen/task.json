@@ -5,6 +5,7 @@
     "python tools/audit.py",
     "python -m pytest -q tests"
   ],
+  "trap_paths": ["src/settings.py"],
   "sessions": [
     {
       "id": "s1",

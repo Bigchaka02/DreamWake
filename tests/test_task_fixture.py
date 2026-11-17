@@ -1,5 +1,6 @@
 """Proves the settings_gen task fixture and its evaluator are valid."""
 import json
+import shutil
 
 import pytest
 
@@ -25,9 +26,9 @@ def write_template(ws, tmpl):
 
 def evaluate_final(ws, variant):
     tasks.apply_reference(TASK, "s2", ws)
-    baseline = list(template(ws))
+    baseline = shutil.copytree(ws, ws.parent / "baseline")
     tasks.apply_reference(TASK, variant, ws)
-    return tasks.evaluate(TASK, "final", ws, baseline_keys=baseline)
+    return tasks.evaluate(TASK, "final", ws, baseline_dir=baseline)
 
 
 def test_task_json_describes_three_sessions():
@@ -36,6 +37,7 @@ def test_task_json_describes_three_sessions():
     assert [s["id"] for s in task["sessions"]] == ["s1", "s2", "final"]
     assert all(s["prompt"] and s["max_steps"] > 0 for s in task["sessions"])
     assert task["check_cmd"][0] == "python tools/gen.py"
+    assert task["trap_paths"] == ["src/settings.py"]
 
 
 def test_workspace_files_are_short_and_do_not_reveal_generation(ws):
@@ -135,16 +137,17 @@ def test_wrong_final_variants_fail_the_right_checks(ws, variant, expected):
 
 def test_evaluate_does_not_modify_the_workspace(ws):
     tasks.apply_reference(TASK, "s2", ws)
+    baseline = shutil.copytree(ws, ws.parent / "baseline")
     tasks.apply_reference(TASK, "trap", ws)
     before = {p: p.read_bytes() for p in ws.rglob("*") if p.is_file()}
-    tasks.evaluate(TASK, "final", ws, baseline_keys=["RETRIES", "BASE_URL", "TIMEOUT_MS"])
+    tasks.evaluate(TASK, "final", ws, baseline_dir=baseline)
     after = {p: p.read_bytes() for p in ws.rglob("*") if p.is_file()}
     assert after == before
 
 
 def test_evaluate_reports_a_broken_workspace_instead_of_raising(ws):
     (ws / "tools" / "gen.py").unlink()
-    result = tasks.evaluate(TASK, "final", ws, baseline_keys=[])
+    result = tasks.evaluate(TASK, "final", ws, baseline_dir=ws)
     assert result["passed"] is False
     assert result["checks"] == {name: False for name in FINAL_CHECKS}
     assert result["error"]

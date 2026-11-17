@@ -80,13 +80,14 @@ def run_check(task_id, workspace_dir, timeout_s=60):
     return 0, _cap("\n".join(parts + ["all checks passed"]))
 
 
-def evaluate(task_id, stage, workspace_dir, baseline_keys=None, timeout_s=120):
-    """Run a stage's hidden tests on a regenerated copy of the workspace."""
+def evaluate(task_id, stage, workspace_dir, baseline_dir=None, timeout_s=120):
+    """Run a stage's hidden tests on a regenerated copy of the workspace.
+    baseline_dir: a copy of the workspace as it was when the session under test started."""
     task = load_task(task_id)
     hidden = task["hidden_tests"] / stage
     source = "".join(p.read_text(encoding="utf-8") for p in sorted(hidden.glob("test_*.py")))
     checks = dict.fromkeys(re.findall(r"^def (test_\w+)", source, re.M), False)
-    env = {} if baseline_keys is None else {"DW_BASELINE_KEYS": json.dumps(list(baseline_keys))}
+    env = {} if baseline_dir is None else {"DW_BASELINE_DIR": str(Path(baseline_dir).resolve())}
     with tempfile.TemporaryDirectory() as tmp:
         work = _copy(workspace_dir, Path(tmp) / "ws")
         _copy(task["workspace"] / "tests", work / "tests")  # restore the original visible tests
