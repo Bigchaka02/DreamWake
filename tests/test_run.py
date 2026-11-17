@@ -28,14 +28,14 @@ def perfect(name):
     return writes(name) + [("run_tests", {}), ("finish", {"summary": "done"})]
 
 
-def scripted_agent(scripts):
-    """A fake chat: picks the script for a session from its prompt; sleep calls (no tools) get NOTE."""
+def scripted_agent(scripts, note=NOTE):
+    """A fake chat: picks the script for a session from its prompt; sleep calls (no tools) get `note`."""
     state = {"queue": []}
 
     def chat(messages, tools=None, *, max_tokens, seed=None, **kwargs):
         if tools is None:
             chat.sleep_seeds.append(seed)
-            return {"content": NOTE, "tool_calls": [], "usage": {"prompt_tokens": 80, "completion_tokens": 30},
+            return {"content": note, "tool_calls": [], "usage": {"prompt_tokens": 80, "completion_tokens": 30},
                     "seconds": 2.0, "finish_reason": "stop"}
         chat.seeds.append(seed)
         if len(messages) == 2:  # a fresh session: [system, request]
@@ -87,6 +87,24 @@ def test_perfect_agent_gives_a_valid_wake_and_passes_every_design(tmp_path, monk
     assert config["git_commit"] and config["started"] and isinstance(config["git_dirty"], bool)
     assert len(chat.sleep_seeds) == 2 and None not in chat.sleep_seeds and len(set(chat.sleep_seeds)) == 2
     assert not set(chat.sleep_seeds) & set(chat.seeds)  # sleep seeds do not collide with any session step seed
+
+
+def test_consolidated_design_runs_end_to_end_and_injects_its_rules_and_lessons(tmp_path):
+    out = tmp_path / "out"
+    memory = ('{"kind": "rule", "text": "Store durations in milliseconds with the _MS suffix."}\n'
+              '{"kind": "lesson", "text": "src/settings.py is generated; edit settings.tmpl.json instead."}')
+    chat = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")}, memory)
+    run.run_experiment(TASK, ["workspace", "handoff", "consolidated"], 1, 4096, 700, out, chat)
+    workspace, handoff, consolidated = rows(out)
+    expected = ("- RULE: Store durations in milliseconds with the _MS suffix.\n"
+                "- LESSON: src/settings.py is generated; edit settings.tmpl.json instead.")
+    assert consolidated["design"] == "consolidated" and consolidated["valid"] and consolidated["passed"]
+    assert consolidated["memory"] == expected and consolidated["memory_chars"] == len(expected)
+    assert consolidated["memory_tokens"] == llm.estimate_tokens(agent.MEMORY.format(memory=expected))
+    assert expected in chat.systems[-1]
+    sleep_calls = len(chat.sleep_seeds) - handoff["sleep_cost"]["calls"]
+    assert sleep_calls >= 4 and consolidated["sleep_cost"]["calls"] == sleep_calls  # >= 1 extract + 1 merge each
+    assert consolidated["sleep_cost"]["prompt_tokens"] == 80 * sleep_calls
 
 
 def test_editing_the_generated_file_in_the_final_session_fails_and_counts_as_repeated(tmp_path):

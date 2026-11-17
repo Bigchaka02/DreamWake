@@ -180,15 +180,32 @@ def _render(event):
     return "\n".join(lines)
 
 
-def render_events(events, max_chars=None):
-    """Compact transcript; with max_chars, the most recent whole steps that fit."""
+def _blocks(events):
+    """One rendered text per step."""
     blocks, step = [], object()
     for event in events:
         if not blocks or event.get("step", step) != step:  # a stepless user event joins the current block
             blocks.append([])
             step = event.get("step", step)
         blocks[-1].append(_render(event))
-    texts = ["\n".join(block) for block in blocks]
+    return ["\n".join(block) for block in blocks]
+
+
+def render_chunks(events, max_chars):
+    """The whole transcript as consecutive chunks of at most max_chars, cut at step boundaries;
+    each chunk starts with the session's request line so it reads on its own."""
+    head, chunks = _render(events[0]), []
+    for block in _blocks(events[1:]):
+        if chunks and len(chunks[-1]) + 1 + len(block) <= max_chars:
+            chunks[-1] += "\n" + block
+        else:
+            chunks.append((head + "\n" + block)[:max_chars])  # a step too long for one chunk keeps its start
+    return chunks
+
+
+def render_events(events, max_chars=None):
+    """Compact transcript; with max_chars, the most recent whole steps that fit."""
+    texts = _blocks(events)
     if max_chars is None:
         return "\n".join(texts)
     kept, size = [], -1

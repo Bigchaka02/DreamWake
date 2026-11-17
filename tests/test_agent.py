@@ -440,3 +440,23 @@ def test_render_events_tail_respects_max_chars_and_cuts_at_step_boundaries():
     two = agent.render_events(EVENTS, max_chars=len(full) - 1)
     assert two.startswith("STEP 1") and len(two) <= len(full) - 1
     assert agent.render_events(EVENTS, max_chars=0) == ""
+
+
+def test_render_chunks_cover_every_step_once_in_order_within_max_chars_each_starting_with_the_request():
+    events = [{"type": "user", "text": "fix it"}]
+    for step in range(1, 21):
+        events += [{"type": "call", "step": step, "tool": "read_file", "args": {"path": f"f{step}.py"}},
+                   {"type": "result", "step": step, "text": "r" * 100}]
+    head = "USER: fix it\n"
+    chunks = agent.render_chunks(events, 700)
+    assert len(chunks) > 1
+    assert all(chunk.startswith(head) and len(chunk) <= 700 for chunk in chunks)
+    assert "\n".join(chunk[len(head):] for chunk in chunks) == agent.render_events(events)[len(head):]
+
+
+def test_render_chunks_truncate_a_step_too_long_for_one_chunk_instead_of_dropping_it():
+    chunks = agent.render_chunks(EVENTS, 300)
+    assert len(chunks) == 3 and all(len(chunk) <= 300 for chunk in chunks)
+    assert chunks[0].startswith("USER: fix it\nSTEP 1 write_file(path='a.py')")
+    assert chunks[1] == "USER: fix it\nSTEP 2 said: done?\nUSER: " + agent.NUDGE
+    assert chunks[2].startswith("USER: fix it\nSTEP 3 said: checking\nSTEP 3 run_tests()")
