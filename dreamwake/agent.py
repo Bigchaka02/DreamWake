@@ -1,4 +1,5 @@
 """The plain agent loop: five tools, a rolling context window, and a full untrimmed event record."""
+import copy
 import json
 import time
 from pathlib import Path
@@ -88,7 +89,7 @@ def _execute(task_id, workspace, name, args, known):
 
 
 def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat, memory="", memory_at="system",
-                finish_gate=False, seed=None, log_path=None):
+                finish_gate=False, seed=None, log_path=None, on_event=None):
     if memory_at not in ("system", "request", "tail"):
         raise ValueError("memory_at must be 'system', 'request' or 'tail'")
     workspace = Path(workspace).resolve()
@@ -102,6 +103,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "max_prompt_tokens": 0}
     steps, finished, silent, overflow, start = 0, False, 0, False, time.perf_counter()
     gated = False
+    interrupted = False
     ignored_calls = 0
     known, ratio = set(), 1.0  # ratio: the server's prompt token count over our estimate, once measured
     try:
@@ -170,11 +172,17 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
                 units.append([{"role": "assistant", "content": content}, {"role": "user", "content": NUDGE}])
             events += new
             log += new
+            if on_event is not None:
+                for event in new:
+                    on_event(copy.deepcopy(event))
+    except KeyboardInterrupt:
+        interrupted, finished = True, False
     finally:
         if log_path:
             Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             Path(log_path).write_text("".join(json.dumps(line) + "\n" for line in log), encoding="utf-8")
-    ended_by = "finish" if finished else "overflow" if overflow else "no_tool_calls" if silent >= 2 else "max_steps"
+    ended_by = ("interrupted" if interrupted else "finish" if finished else "overflow" if overflow
+                else "no_tool_calls" if silent >= 2 else "max_steps")
     return {"finished": finished, "gated": gated, "steps": steps, "ended_by": ended_by,
             "ignored_calls": ignored_calls,
             "ran_out_of_steps": ended_by == "max_steps", "overflow": overflow,

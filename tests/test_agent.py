@@ -146,6 +146,56 @@ def test_finish_ends_the_session(ws):
     assert result["events"][0] == {"type": "user", "text": PROMPT}
 
 
+def test_on_event_observes_every_completed_event_in_order_without_changing_the_result(ws):
+    replies = [reply(content="thinking"), reply(("list_files", {})), FINISH]
+    baseline, _ = run(ws, replies)
+    seen = []
+
+    def observe(event):
+        seen.append(json.loads(json.dumps(event)))
+        event["type"] = "changed"
+        if "args" in event:
+            event["args"]["summary"] = "changed"
+
+    result, _ = run(ws, replies, on_event=observe)
+    assert seen == baseline["events"][1:]
+    assert [e["type"] for e in seen] == ["say", "user", "call", "result", "call", "result"]
+    assert {k: v for k, v in result.items() if k != "seconds"} == {
+        k: v for k, v in baseline.items() if k != "seconds"}
+
+
+@pytest.mark.parametrize("during", ["chat", "tool"])
+@pytest.mark.parametrize("completed", [0, 1])
+def test_interrupt_keeps_completed_events_writes_log_and_leaves_no_half_event(
+        ws, tmp_path, monkeypatch, during, completed):
+    log = tmp_path / "interrupted.jsonl"
+    seen = []
+    fake = FakeChat([reply(("list_files", {}))] * completed + [reply(("run_tests", {}))])
+
+    def interrupt_check(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    def chat(*args, **kwargs):
+        if during == "chat" and len(fake.calls) == completed:
+            raise KeyboardInterrupt
+        return fake(*args, **kwargs)
+
+    if during == "tool":
+        monkeypatch.setattr(tasks, "run_check", interrupt_check)
+    try:
+        result = agent.run_session(TASK, ws, PROMPT, chat=chat, max_steps=10, window=100_000,
+                                   reserve=500, log_path=log, on_event=seen.append)
+    except KeyboardInterrupt:
+        pytest.fail("the session propagated KeyboardInterrupt")
+    assert result["ended_by"] == "interrupted"
+    assert not result["finished"] and not result["ran_out_of_steps"]
+    assert result["steps"] == completed + 1
+    assert len(result["events"]) == 1 + 2 * completed
+    assert seen == result["events"][1:]
+    logged = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [e for e in logged if e["type"] != "step"] == result["events"]
+
+
 def test_step_cap_ends_the_session_with_ran_out_of_steps(ws):
     result, fake = run(ws, [reply(("list_files", {}))] * 5, max_steps=3)
     assert result["steps"] == 3 and len(fake.calls) == 3
