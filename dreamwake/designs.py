@@ -33,25 +33,29 @@ MERGE_INSTRUCTION = (
     "- Merge duplicates. Keep each item a general instruction, at most 35 words. At most 8 items. "
     "Output only the JSON lines.")
 DREAM_INSTRUCTION = (
-    "Invent 2 new, different change requests of the same kind and size that a teammate could plausibly ask next on "
-    "this project. They are hypothetical practice exercises, not real requests. Phrase them the way a user who does "
-    "NOT know the project's rules would. Output JSON lines, one object per line: {\"request\": \"...\"}")
-REVIEW_INSTRUCTION = (
-    "You are checking whether an agent followed the project's rules in a practice exercise. For each rule decide "
-    "whether the changes follow it. Output JSON lines, one per broken rule: {\"rule\": <number>, \"problem\": "
-    "\"<what was done wrong, concretely>\"}. If the check failed for a reason no rule covers, add {\"rule\": 0, "
-    "\"problem\": \"...\"}. If nothing is wrong, output the single word NONE.")
+    "Write 2 practice exercises that test whether an agent applies the rules above without being told. Each "
+    "exercise is a small new feature request of the same kind as the example - not a policy change, and not "
+    "something already done. Prefer rules that nothing in the project checks automatically (a user decision, a "
+    "naming, format or unit policy): breaking those gives no error. Write each request the way a teammate who does "
+    "not know the rules would: say only what they need, in everyday terms, without naming files, setting names, "
+    "suffixes or conventions. Then give short exact strings for checking the result: \"must_add\" = strings that "
+    "will appear in the text added to the project when the rules are applied; \"must_not_add\" = strings that would "
+    "appear only if a rule were ignored. Keep each string short (a suffix, a converted value), never a whole line. "
+    "The exercises are hypothetical. Output JSON lines, one object per line: "
+    "{\"request\": \"...\", \"must_add\": [\"...\"], \"must_not_add\": [\"...\"]}")
 REFINE_INSTRUCTION = (
-    "An agent that was given these rules still made the mistakes above in a practice exercise. Rewrite the rules so "
-    "that an agent reading them would not make these mistakes: make each broken rule more specific and actionable - "
-    "say exactly what to do and where, and how to name or convert things, with one short example. Keep every other "
-    "rule as it is. Do not add facts about the practice exercise itself: it was hypothetical. Output the complete "
-    "list as JSON lines, one object per line: {\"kind\": \"rule\" or \"lesson\", \"text\": \"...\"}")
+    "An agent that was given the rules above got this request and made the mistakes listed. Rewrite the rules so "
+    "that an agent reading them gets it right: make the rule that was not applied more specific and actionable - "
+    "say exactly what to do when a request is phrased like this one, including how to name or convert things, with "
+    "one short example. Never reverse or weaken a rule. Keep every other rule as it is. Do not record the practice "
+    "request or its feature as a fact: it was hypothetical. Output the complete list as JSON lines, one object per "
+    "line: {\"kind\": \"rule\" or \"lesson\", \"text\": \"...\"}")
 NOTE_CAP = 900  # characters of injected memory, for every design
 ITEM_CAP, TEXT_CAP = 8, 240
+REPLACES, REPLACES_CAP = "(replaces:", 60  # a longer or unterminated "(replaces: ...)" copies an old rule
 FRAMING_TOKENS = 50  # chat-template tokens around the single message, by estimate
-PRACTICE_ROUNDS = 2
-FILE_CAP, CHANGES_CAP, CHECK_TAIL = 500, 1500, 400  # characters shown to the reviewer
+EXERCISES, EXPECT_CAP = 2, 4  # practice exercises per sleep; strings per must_add / must_not_add list
+ADDED_CAP, CHECK_TAIL = 800, 300  # characters of added text and of check output shown to the refine call
 
 
 def _loads(text):
@@ -72,9 +76,19 @@ def _objects(text, key):
             if isinstance(value, dict) and isinstance(value.get(key), str) and value[key].strip()]
 
 
+def _clean(text):
+    """The text cut before its "(replaces: ...)" when that is unterminated or longer than REPLACES_CAP."""
+    start = text.find(REPLACES)
+    end = text.find(")", start)
+    if start >= 0 and (end < 0 or len(text[start + len(REPLACES):end].strip()) > REPLACES_CAP):
+        return text[:start].strip()
+    return text
+
+
 def parse_items(text):
-    return [{"kind": value.get("kind", "rule"), "text": value["text"].strip()[:TEXT_CAP]}
-            for value in _objects(text, "text") if value.get("kind", "rule") in ("rule", "lesson")]
+    items = [{"kind": value.get("kind", "rule"), "text": _clean(value["text"].strip()[:TEXT_CAP])}
+             for value in _objects(text, "text") if value.get("kind", "rule") in ("rule", "lesson")]
+    return [item for item in items if item["text"]]
 
 
 def _json_lines(items):
@@ -131,89 +145,111 @@ def _numbered(items):
     return "\n".join(f"{i}. {item['kind'].upper()}: {item['text']}" for i, item in enumerate(items, 1)) or "(none)"
 
 
-def _changes(events):
-    """What a session wrote: the last successful write per path, capped for the reviewer."""
-    failed = {e["step"] for e in events if e["type"] == "result" and e["text"].startswith("error")}
-    written = {}
-    for e in events:
-        if e["type"] == "call" and e["tool"] == "write_file" and e["step"] not in failed:
-            written[e["args"]["path"]] = e["args"]["content"][:FILE_CAP]
-    return "\n\n".join(f"FILE {path}:\n{content}" for path, content in written.items())[:CHANGES_CAP]
+def _fit(build, budget, *texts):
+    """build(*texts), cutting the end off texts[0], then texts[1], ... until the prompt fits the budget."""
+    texts = list(texts)
+    for i in range(len(texts)):
+        while (excess := estimate_tokens(build(*texts)) - budget) > 0 and texts[i]:
+            texts[i] = texts[i][:-(int(excess * CHARS_PER_TOKEN) + 1)]
+    return build(*texts)
 
 
-def _review_prompt(rules, request, changes, passed, output, budget):
-    """Trimmed to the budget: the changes first, then the check output."""
-    output = output[-CHECK_TAIL:]
-
-    def prompt():
-        return (f"RULES:\n{_numbered(rules)}\n\nREQUEST:\n{request}\n\nCHANGES:\n{changes or '(none)'}\n\n"
-                f"CHECK RESULT: {'passed' if passed else 'failed'}\n{output}\n\n" + REVIEW_INSTRUCTION)
-    while (excess := estimate_tokens(prompt()) - budget) > 0 and (changes or output):
-        cut = int(excess * CHARS_PER_TOKEN) + 1
-        changes, output = (changes[:-cut], output) if changes else (changes, output[cut:])
-    return prompt()
+def _strings(value):
+    """A dream's must_add / must_not_add: stripped, non-empty strings, at most EXPECT_CAP (one string is a list)."""
+    values = [value] if isinstance(value, str) else value if isinstance(value, list) else []
+    return [s.strip() for s in values if isinstance(s, str) and s.strip()][:EXPECT_CAP]
 
 
-def _refine_prompt(rules, problems, budget):
-    """Trimmed to the budget by dropping the last mistakes (one is always kept)."""
-    mistakes = [f"- rule {p['rule']}: {p['problem']}" for p in problems]
-    while True:
-        prompt = f"RULES:\n{_numbered(rules)}\n\nMISTAKES:\n" + "\n".join(mistakes) + "\n\n" + REFINE_INSTRUCTION
-        if estimate_tokens(prompt) <= budget or len(mistakes) <= 1:
-            return prompt
-        mistakes.pop()
+def _dreams(reply):
+    """The usable dreamed exercises: a request and at least one must_add string."""
+    dreams = [{"request": v["request"].strip(), "hypothetical": True, "must_add": _strings(v.get("must_add")),
+               "must_not_add": _strings(v.get("must_not_add"))} for v in _objects(reply, "request")]
+    return [dream for dream in dreams if dream["must_add"]]
+
+
+def _added(sandbox, snapshot):
+    """The text a practice attempt added: per file, the lines not in the snapshot's version (all of a new file)."""
+    added = []
+    for path in sorted(Path(sandbox).rglob("*")):
+        relative = path.relative_to(sandbox)
+        if not path.is_file() or agent.SKIP_DIRS & set(relative.parts):
+            continue
+        old = Path(snapshot) / relative
+        before = set(old.read_text(encoding="utf-8", errors="ignore").splitlines()) if old.is_file() else set()
+        added += [line for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                  if line not in before]
+    return "\n".join(added)
+
+
+def _refine_prompt(items, exercise, result, budget):
+    """Trimmed to the budget: the added text first, then the check output, then the request."""
+    faults = ([f"The added text should contain '{s}' but does not" for s in result["missing"]]
+              + [f"The added text contains '{s}', which must not appear" for s in result["present"]])
+
+    def build(added, output, request):
+        problems = ([] if result["passed"] else [f"The project check failed: {output}"]) + faults
+        return (f"RULES:\n{_numbered(items)}\n\nREQUEST: {request}\n\nWHAT THE AGENT ADDED:\n{added or '(nothing)'}"
+                "\n\nPROBLEMS:\n" + "\n".join(problems) + "\n\n" + REFINE_INSTRUCTION)
+    return _fit(build, budget, result["added"][:ADDED_CAP], result["output"][-CHECK_TAIL:], exercise["request"])
 
 
 def _practise(design, items, practice, chat, window, reserve, seed, cost):
-    """PRACTICE_ROUNDS rounds of attempt -> review, and on any problem refine -> validate; a rewrite is kept only
-    if it lowers the score without losing items. Returns (items, practice log); adds to cost."""
+    """Attempt EXERCISES exercises with the items, scored by code; if any fails, one refine call rewrites the
+    items and both are attempted again. The rewrite is kept only if no score rises, the total falls and no item
+    is lost. Returns (items, this sleep's practice record); adds to cost."""
     cost["practice_sessions"] = 0
     budget, used = window - reserve - FRAMING_TOKENS, [0]
 
-    def fresh(span=1):  # shortcut: offsets (at most 4 * max_steps + 11) stay under run.py's stride of 100 up to 22
+    def fresh(span=1):  # shortcut: offsets (at most 4 * max_steps + 6) stay under run.py's stride of 100 up to 23
         used[0] += span
         return None if seed is None else seed + used[0] - span + 1
 
     def ask(prompt):
         return _ask(chat, prompt, reserve, fresh(), cost)
 
-    def attempt(request, snapshot, memory_items, rules):
+    def attempt(exercise, memory_items):
         sandbox = Path(practice["scratch"]) / f"attempt{cost['practice_sessions']}"
         cost["practice_sessions"] += 1
         shutil.rmtree(sandbox, ignore_errors=True)
         tasks._copy(snapshot, sandbox)  # never run in the snapshot itself
-        result = agent.run_session(practice["task_id"], sandbox, request,
+        result = agent.run_session(practice["task_id"], sandbox, exercise["request"],
                                    memory=inject("consolidated", {"items": memory_items}),
                                    max_steps=practice["max_steps"], window=window, reserve=reserve, chat=chat,
                                    seed=fresh(practice["max_steps"] + 1), log_path=sandbox.with_suffix(".jsonl"))
         for key in ("prompt_tokens", "completion_tokens", "seconds"):
             cost[key] += result[key]
         code, output = tasks.run_check(practice["task_id"], sandbox)
-        reply = ask(_review_prompt(rules, request, _changes(result["events"]), code == 0, output, budget))
-        problems = [{"rule": v.get("rule"), "problem": v["problem"].strip()[:TEXT_CAP]}
-                    for v in _objects(reply, "problem")]
-        return (code != 0) + len(problems), problems
+        added = _added(sandbox, snapshot)
+        missing = [s for s in exercise["must_add"] if s not in added]
+        present = [s for s in exercise["must_not_add"] if s in added]
+        return {"score": (code != 0) + len(missing) + len(present), "passed": code == 0, "output": output,
+                "added": added, "missing": missing, "present": present}
 
-    real = practice["request"]
+    real = {"request": practice["request"], "hypothetical": False, "must_add": [], "must_not_add": []}
     if design == "replay":
-        exercises = [(real, practice["ws_before"], False)] * PRACTICE_ROUNDS
+        snapshot, exercises = practice["ws_before"], [real] * EXERCISES
     else:
-        reply = ask(f"Here is a change request you handled on this project:\n{real}\n\n" + DREAM_INSTRUCTION)
-        dreams = [v["request"].strip() for v in _objects(reply, "request")][:PRACTICE_ROUNDS]
-        exercises = [(dream, practice["ws_after"], True) for dream in dreams]
-        exercises += [(real, practice["ws_after"], False)] * (PRACTICE_ROUNDS - len(dreams))
-    log = []
-    for request, snapshot, hypothetical in exercises:
-        score, problems = attempt(request, snapshot, items, items)
-        entry = {"request": request, "hypothetical": hypothetical, "score": score, "problems": problems,
-                 "refined": score > 0, "score2": None, "accepted": False}
-        if score:
-            candidate = _capped(parse_items(ask(_refine_prompt(items, problems, budget))))
-            entry["score2"], _ = attempt(request, snapshot, candidate, items)  # reviewed against the ORIGINAL rules
-            if entry["score2"] < score and len(candidate) >= len(items):
-                items, entry["accepted"] = candidate, True
-        log.append(entry)
-    return items, log
+        snapshot = practice["ws_after"]
+        prompt = _fit(lambda example: (f"RULES:\n{_numbered(items)}\n\nAn example of what users ask on this project:"
+                                       f"\n{example}\n\n" + DREAM_INSTRUCTION), budget, real["request"])
+        exercises = _dreams(ask(prompt))[:EXERCISES]
+        exercises += [real] * (EXERCISES - len(exercises))
+    first = [attempt(exercise, items) for exercise in exercises]
+    record = {"exercises": [{**exercise, "score": result["score"], "score2": None, "check_passed": result["passed"],
+                             "check_passed2": None} for exercise, result in zip(exercises, first)],
+              "refined": False, "accepted": False}
+    failed = [(exercise, result) for exercise, result in zip(exercises, first) if result["score"]]
+    if not failed:
+        return items, record
+    candidate = _capped(parse_items(ask(_refine_prompt(items, *failed[0], budget))))
+    second = [attempt(exercise, candidate) for exercise in exercises]
+    for entry, result in zip(record["exercises"], second):
+        entry["score2"], entry["check_passed2"] = result["score"], result["passed"]
+    before, after = [r["score"] for r in first], [r["score"] for r in second]
+    record["refined"] = True
+    record["accepted"] = (all(a <= b for a, b in zip(after, before)) and sum(after) < sum(before)
+                          and len(candidate) >= len(items))
+    return (candidate if record["accepted"] else items), record
 
 
 def _identifiers(text):
@@ -224,7 +260,8 @@ def contamination(memory, practice_log, wake_events):
     """Identifiers (backticked or UPPER_SNAKE, 5+ characters) of hypothetical practice requests that reached the
     memory but appear nowhere in the real sessions. Sorted."""
     real = json.dumps(wake_events, ensure_ascii=False)
-    dreamt = _identifiers("\n".join(entry["request"] for entry in practice_log if entry["hypothetical"]))
+    dreamt = _identifiers("\n".join(entry["request"] for record in practice_log for entry in record["exercises"]
+                                    if entry["hypothetical"]))
     return sorted(name for name in dreamt if name in memory and name not in real)
 
 
@@ -248,8 +285,8 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
         return _consolidate(artifact, events, chat, window, reserve, seed)
     if design in ("dreaming", "replay"):
         artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
-        items, log = _practise(design, artifact["items"], practice, chat, window, reserve, seed, cost)
-        return {"items": items, "practice": log}, cost
+        items, record = _practise(design, artifact["items"], practice, chat, window, reserve, seed, cost)
+        return {"items": items, "practice": [record]}, cost  # run.py appends each sleep's records, s1 first
     raise ValueError(f"unknown design: {design!r}")
 
 
