@@ -1,4 +1,4 @@
-"""Run the experiment: a shared wake (s1, s2), then per design sleep -> reset -> final session -> hidden tests.
+"""Run the experiment: shared wake sessions, then per design sleep -> reset -> final session -> hidden tests.
 
 python -m dreamwake.run --task settings_gen --designs workspace,handoff --seeds 3 --window 4096 --reserve 1024
 python -m dreamwake.run --summarize runs/<name>
@@ -81,25 +81,29 @@ def _snapshot(workspace, dest):
 
 
 def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
-    """Run s1 then s2 on one workspace until s2's hidden tests pass. Returns (workspace or None, wake)."""
+    """Run the wakes until the last scored wake passes. Returns (workspace or None, wake)."""
     for attempt in range(1, wake_retries + 2):
         workspace = seed_dir / "ws_wake"
         shutil.rmtree(workspace, ignore_errors=True)
         tasks.make_workspace(task_id, workspace)
         suffix = "" if attempt == 1 else f".attempt{attempt}"
         wake = {"attempts": attempt, "events": []}
-        for i, sid in enumerate(("s1", "s2")):
+        valid = True
+        for i, session in enumerate(sessions[:-1]):
+            sid = session["id"]
             seed = k * SEED_STRIDE + attempt * ATTEMPT_STRIDE + i * SESSION_STRIDE
             _snapshot(workspace, seed_dir / f"snap_{sid}_before")
-            result = _session(task_id, sessions[sid], workspace, chat, window, reserve, seed,
+            result = _session(task_id, session, workspace, chat, window, reserve, seed,
                               seed_dir / f"wake_{sid}{suffix}.jsonl")
             _snapshot(workspace, seed_dir / f"snap_{sid}_after")
-            evaluation = tasks.evaluate(task_id, sid, workspace)
-            if evaluation.get("error"):  # the evaluator broke; that says nothing about the agent
-                raise RuntimeError(evaluation["error"])
-            wake[f"{sid}_passed"] = evaluation["passed"]
+            stage = session.get("stage", sid)
+            if stage is not None:
+                evaluation = tasks.evaluate(task_id, stage, workspace)
+                if evaluation.get("error"):  # the evaluator broke; that says nothing about the agent
+                    raise RuntimeError(evaluation["error"])
+                valid = wake[f"{sid}_passed"] = evaluation["passed"]
             wake["events"].append(result["events"])
-        if wake["s2_passed"]:
+        if valid:
             return workspace, wake
     return None, wake
 
@@ -112,8 +116,9 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
     practice_log = []
     memory = oracle_memory
     if store != "oracle":
-        for i, (sid, events) in enumerate(zip(("s1", "s2"), wake["events"])):
-            practice = {"task_id": task_id, "request": sessions[sid]["prompt"],
+        for i, (session, events) in enumerate(zip(sessions[:-1], wake["events"])):
+            sid = session["id"]
+            practice = {"task_id": task_id, "request": session["prompt"],
                         "ws_before": seed_dir / f"snap_{sid}_before", "ws_after": seed_dir / f"snap_{sid}_after",
                         "scratch": seed_dir / f"practice_{label}_{sid}", "max_steps": PRACTICE_STEPS,
                         "memory_at": placement, "finish_gate": gate}
@@ -129,15 +134,17 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
         tasks._copy(wake_ws, workspace)
         suffix = f".r{r}" if r else ""
         seed = k * SEED_STRIDE + FINAL_OFFSET + r * SESSION_STRIDE
-        result = _session(task_id, sessions["final"], workspace, chat, window, reserve, seed,
+        session = sessions[-1]
+        result = _session(task_id, session, workspace, chat, window, reserve, seed,
                           seed_dir / f"final_{label}{suffix}.jsonl", memory, memory_at=placement, finish_gate=gate)
-        evaluation = tasks.evaluate(task_id, "final", workspace, baseline_dir=baseline)
+        evaluation = tasks.evaluate(task_id, session.get("stage", session["id"]), workspace, baseline_dir=baseline)
         repeated = _wrote_trap(result["events"], trap_paths, workspace)
         archive = seed_dir / f"final_{label}_ws{suffix}"
         shutil.rmtree(archive, ignore_errors=True)
         shutil.move(workspace, archive)
         rows.append({"repeat": r, "checks": evaluation["checks"], "passed": evaluation["passed"],
                      "eval_error": evaluation.get("error"), "steps": result["steps"], "ended_by": result["ended_by"],
+                     "gated": result["gated"],
                      "ran_out_of_steps": result["ran_out_of_steps"], "overflow": result["overflow"],
                      "repeated_mistake": repeated, "prompt_tokens": result["prompt_tokens"],
                      "completion_tokens": result["completion_tokens"], "max_prompt_tokens": result["max_prompt_tokens"],
@@ -151,16 +158,20 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
 def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3, final_repeats=1):
     parsed = [parse_design(design) for design in designs_]  # validate every spec before any model call
     task = tasks.load_task(task_id)
+    sessions = task["sessions"]
+    if not 2 <= len(sessions) <= 10:
+        raise ValueError("task must have between one and nine wake sessions")
+    if sessions[-1].get("stage", sessions[-1]["id"]) is None:
+        raise ValueError("final session stage must not be null")
     oracle_memory = ""
     if any(store == "oracle" for store, _, _ in parsed):
-        path = task["dir"] / "oracle_memory.txt"
+        path = task["oracle_memory"]
         try:
             oracle_memory = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             raise ValueError(f"missing oracle_memory.txt for task {task_id!r}") from None
         if len(oracle_memory) > designs.NOTE_CAP:
             raise ValueError(f"oracle_memory.txt exceeds NOTE_CAP ({designs.NOTE_CAP} characters)")
-    sessions = {s["id"]: s for s in task["sessions"]}
     trap_paths = set(task.get("trap_paths", []))
     out = Path(out_dir)
     if (out / "results.jsonl").exists():
@@ -178,9 +189,10 @@ def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wak
         rows = []  # written only once every design of this seed is done, so seeds stay paired
         try:
             wake_ws, wake = _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries)
-            flags = {"s1_passed": wake["s1_passed"], "s2_passed": wake["s2_passed"],
-                     "trap_experienced": any(_wrote_trap(events, trap_paths, seed_dir / "ws_wake")
-                                             for events in wake["events"])}
+            flags = {f"{s['id']}_passed": wake[f"{s['id']}_passed"] for s in sessions[:-1]
+                     if s.get("stage", s["id"]) is not None}
+            flags["trap_experienced"] = any(_wrote_trap(events, trap_paths, seed_dir / "ws_wake")
+                                            for events in wake["events"])
             baseline = None
             if wake_ws:
                 baseline = seed_dir / "baseline"

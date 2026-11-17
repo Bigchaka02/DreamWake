@@ -115,6 +115,289 @@ def rows(out):
     return [json.loads(line) for line in (out / "results.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
+def tiny_task(tmp_path, monkeypatch, sessions, passing=None):
+    """Real tiny workspaces and hidden tests, driven only by a fake chat transport."""
+    task_dir = tmp_path / "tasks" / "tiny"
+    workspace = task_dir / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "state.txt").write_text("", encoding="utf-8")
+    task = {"id": "tiny", "sessions": sessions, "check_cmd": [], "protected": []}
+    (task_dir / "task.json").write_text(json.dumps(task), encoding="utf-8")
+    states, state = {}, ""
+    for session in sessions:
+        state += session["id"] + "\n"
+        states[session["prompt"]] = state
+        stage = session.get("stage", session["id"])
+        if stage is not None:
+            hidden = task_dir / "hidden_tests" / stage
+            hidden.mkdir(parents=True, exist_ok=True)
+            expected = state if (passing or {}).get(session["id"], True) else "wrong"
+            (hidden / "test_state.py").write_text(
+                "from pathlib import Path\n\ndef test_state():\n"
+                f"    assert Path('state.txt').read_text(encoding='utf-8') == {expected!r}\n",
+                encoding="utf-8")
+    monkeypatch.setattr(tasks, "TASKS_DIR", task_dir.parent)
+    queue = []
+
+    def chat(messages, tools=None, *, seed=None, **kwargs):
+        if tools is None:
+            return {"content": NOTE, "tool_calls": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "seconds": 1.0, "finish_reason": "stop"}
+        if len(messages) == 2:
+            chat.starts.append((messages, seed))
+            prompt = messages[1]["content"]
+            queue[:] = [("read_file", {"path": "state.txt"}),
+                        ("write_file", {"path": "state.txt", "content": states[prompt]})]
+        name, args = queue.pop(0) if queue else ("finish", {"summary": "done"})
+        return {"content": "", "tool_calls": [{"name": name, "arguments": args, "raw": json.dumps(args)}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10}, "seconds": 1.0,
+                "finish_reason": "tool_calls"}
+    chat.starts = []
+    return chat
+
+
+def test_four_wakes_keep_order_snapshots_sleep_seeds_and_stages(tmp_path, monkeypatch):
+    sessions = [{"id": "first", "prompt": "one", "max_steps": 4},
+                {"id": "second", "stage": "revision", "prompt": "two", "max_steps": 4},
+                {"id": "third", "stage": None, "prompt": "three", "max_steps": 4},
+                {"id": "fourth", "stage": None, "prompt": "four", "max_steps": 4},
+                {"id": "last", "stage": "score", "prompt": "end", "max_steps": 4}]
+    chat = tiny_task(tmp_path, monkeypatch, sessions, {"first": False})
+    real_sleep, sleeps = designs.sleep, []
+
+    def sleep(store, artifact, events, **kwargs):
+        sleeps.append((store, artifact, events, kwargs))
+        return real_sleep(store, artifact, events, **kwargs)
+    monkeypatch.setattr(designs, "sleep", sleep)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["workspace", "handoff"], 2, 4096, 700, out, chat, wake_retries=0)
+    assert len(chat.starts) == 12
+    assert len(sleeps) == 16
+    for k in range(2):
+        seed_dir = out / f"seed{k}"
+        starts = chat.starts[k * 6:(k + 1) * 6]
+        assert [messages[1]["content"] for messages, _ in starts] == [s["prompt"] for s in sessions] + ["end"]
+        assert [seed for _, seed in starts[:4]] == [
+            k * run.SEED_STRIDE + run.ATTEMPT_STRIDE + i * run.SESSION_STRIDE + 1 for i in range(4)]
+        assert all(messages == [{"role": "system", "content": agent.SYSTEM.format(max_steps=4)},
+                                {"role": "user", "content": s["prompt"]}]
+                   for (messages, _), s in zip(starts, sessions[:4]))
+        state = ""
+        for i, s in enumerate(sessions[:4]):
+            sid = s["id"]
+            before, after = seed_dir / f"snap_{sid}_before", seed_dir / f"snap_{sid}_after"
+            assert (before / "state.txt").read_text(encoding="utf-8") == state
+            state += sid + "\n"
+            assert (after / "state.txt").read_text(encoding="utf-8") == state
+            for j, store in enumerate(("workspace", "handoff")):
+                actual_store, artifact, events, kwargs = sleeps[k * 8 + j * 4 + i]
+                assert actual_store == store and events[0] == {"type": "user", "text": s["prompt"]}
+                assert artifact == (NOTE if store == "handoff" and i else None)
+                assert kwargs["seed"] == k * run.SEED_STRIDE + run.SLEEP_OFFSET + i * run.SESSION_STRIDE
+                assert kwargs["practice"] == {
+                    "task_id": "tiny", "request": s["prompt"], "ws_before": before, "ws_after": after,
+                    "scratch": seed_dir / f"practice_{store}_{sid}", "max_steps": run.PRACTICE_STEPS,
+                    "memory_at": "system", "finish_gate": False}
+        for row in rows(out)[k * 2:(k + 1) * 2]:
+            assert row["valid"] and row["passed"] and row["checks"] == {"test_state": True}
+            assert row["wake"] == {"first_passed": False, "second_passed": True, "trap_experienced": False}
+
+
+@pytest.mark.parametrize("stages, passing, valid", [
+    (["early", "later", None], {"early": False, "later": True}, True),
+    (["early", "later", None], {"early": True, "later": False}, False),
+    ([None, None, None], {}, True),
+])
+def test_wake_validity_uses_last_scored_stage(tmp_path, monkeypatch, stages, passing, valid):
+    sessions = [{"id": sid, "stage": stage, "prompt": sid, "max_steps": 3}
+                for sid, stage in zip(("early", "later", "cutoff"), stages)]
+    sessions.append({"id": "end", "prompt": "end", "max_steps": 3})
+    chat = tiny_task(tmp_path, monkeypatch, sessions, passing)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["workspace"], 1, 4096, 700, out, chat, wake_retries=1)
+    [row] = rows(out)
+    assert row["valid"] is valid
+    assert row["wake_attempts"] == (1 if valid else 2)
+    assert row["wake"] == {**{f"{sid}_passed": passed for sid, passed in passing.items()},
+                           "trap_experienced": False}
+    assert len(chat.starts) == (4 if valid else 6)
+    if not valid:
+        assert [seed for _, seed in chat.starts] == [
+            attempt * run.ATTEMPT_STRIDE + i * run.SESSION_STRIDE + 1
+            for attempt in (1, 2) for i in range(3)]
+
+
+@pytest.mark.parametrize("count, null_final", [(0, False), (1, False), (11, False), (3, True)])
+def test_invalid_session_layout_rejected_before_model(tmp_path, monkeypatch, count, null_final):
+    sessions = [{"id": f"s{i}", "prompt": f"session {i}", "max_steps": 3} for i in range(count)]
+    if null_final:
+        sessions[-1]["stage"] = None
+    tiny_task(tmp_path, monkeypatch, sessions)
+
+    def no_chat(*args, **kwargs):
+        pytest.fail("invalid sessions reached the model")
+    with pytest.raises(ValueError, match="wake|final"):
+        run.run_experiment("tiny", ["workspace"], 1, 4096, 700, tmp_path / "out", no_chat)
+
+
+@pytest.mark.parametrize("count", [1, 9])
+def test_one_or_nine_wakes_run(tmp_path, monkeypatch, count):
+    sessions = [{"id": f"wake{i}", "stage": None, "prompt": f"wake {i}", "max_steps": 3}
+                for i in range(count)]
+    sessions.append({"id": "end", "prompt": "end", "max_steps": 3})
+    chat = tiny_task(tmp_path, monkeypatch, sessions)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["workspace"], 1, 4096, 700, out, chat)
+    [row] = rows(out)
+    assert row["valid"] and row["passed"] and row["wake"] == {"trap_experienced": False}
+    assert len(chat.starts) == count + 1
+
+
+@pytest.mark.parametrize("spec, gated", [("workspace", False), ("handoff+gate", True)])
+def test_final_row_records_finish_gate(tmp_path, monkeypatch, spec, gated):
+    sessions = [{"id": "s1", "prompt": "one", "max_steps": 4},
+                {"id": "s2", "prompt": "two", "max_steps": 4},
+                {"id": "final", "prompt": "end", "max_steps": 4}]
+    chat = tiny_task(tmp_path, monkeypatch, sessions)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", [spec], 1, 4096, 700, out, chat)
+    [row] = rows(out)
+    assert row["passed"] and row["gated"] is gated
+
+
+def inherited_task(tmp_path, monkeypatch):
+    sessions = [{"id": "s1", "prompt": "one", "max_steps": 3},
+                {"id": "final", "prompt": "end", "max_steps": 3}]
+    chat = tiny_task(tmp_path, monkeypatch, sessions)
+    base_dir = tasks.TASKS_DIR / "tiny"
+    base = json.loads((base_dir / "task.json").read_text(encoding="utf-8"))
+    base.update(check_cmd=["python check.py"], trap_paths=["trap.txt"],
+                protected=["checks"], eval_setup=["python setup.py"])
+    (base_dir / "task.json").write_text(json.dumps(base), encoding="utf-8")
+    (base_dir / "workspace" / "checks").mkdir()
+    (base_dir / "workspace" / "checks" / "pristine.txt").write_text("base", encoding="utf-8")
+    (base_dir / "workspace" / "check.py").write_text("print('base check')\n", encoding="utf-8")
+    (base_dir / "workspace" / "setup.py").write_text(
+        "from pathlib import Path\nPath('setup.txt').write_text('ready', encoding='utf-8')\n", encoding="utf-8")
+    reference = base_dir / "reference"
+    (reference / "ready").mkdir(parents=True)
+    (reference / "parents.json").write_text('{"ready": null}', encoding="utf-8")
+    (reference / "ready" / "state.txt").write_text("base reference", encoding="utf-8")
+    (base_dir / "oracle_memory.txt").write_text("base memory", encoding="utf-8")
+    child_dir = tasks.TASKS_DIR / "child"
+    child_dir.mkdir()
+    child = {"id": "child", "base": "tiny", "sessions": sessions}
+    (child_dir / "task.json").write_text(json.dumps(child), encoding="utf-8")
+    return base_dir, child_dir, chat
+
+
+def test_task_inherits_defaults_and_paths(tmp_path, monkeypatch):
+    base_dir, child_dir, _ = inherited_task(tmp_path, monkeypatch)
+    base, child = tasks.load_task("tiny"), tasks.load_task("child")
+    assert child["id"] == "child" and child["dir"] == child_dir
+    for key in ("check_cmd", "trap_paths", "protected", "eval_setup", "workspace", "reference"):
+        assert child[key] == base[key]
+    ws = tasks.make_workspace("child", tmp_path / "ws")
+    code, out = tasks.run_check("child", ws)
+    assert code == 0 and "base check" in out
+    tasks.apply_reference("child", "ready", ws)
+    assert (ws / "state.txt").read_text(encoding="utf-8") == "base reference"
+
+
+@pytest.mark.parametrize("local", [("workspace",), ("reference",), ("workspace", "reference")])
+def test_child_values_and_folders_override_base(tmp_path, monkeypatch, local):
+    base_dir, child_dir, _ = inherited_task(tmp_path, monkeypatch)
+    child = json.loads((child_dir / "task.json").read_text(encoding="utf-8"))
+    for key in ("check_cmd", "trap_paths", "protected", "eval_setup"):
+        child[key] = []
+    child["sessions"] = [{"id": "child session"}]
+    (child_dir / "task.json").write_text(json.dumps(child), encoding="utf-8")
+    if "workspace" in local:
+        (child_dir / "workspace").mkdir()
+        (child_dir / "workspace" / "state.txt").write_text("child workspace", encoding="utf-8")
+    if "reference" in local:
+        reference = child_dir / "reference"
+        (reference / "ready").mkdir(parents=True)
+        (reference / "parents.json").write_text('{"ready": null}', encoding="utf-8")
+        (reference / "ready" / "state.txt").write_text("child reference", encoding="utf-8")
+    loaded = tasks.load_task("child")
+    assert loaded["sessions"] == child["sessions"]
+    assert all(loaded[key] == [] for key in ("check_cmd", "trap_paths", "protected", "eval_setup"))
+    for key in ("workspace", "reference"):
+        assert loaded[key] == (child_dir if key in local else base_dir) / key
+    ws = tasks.make_workspace("child", tmp_path / "ws")
+    assert (ws / "state.txt").read_text(encoding="utf-8") == ("child workspace" if "workspace" in local else "")
+    tasks.apply_reference("child", "ready", ws)
+    expected = "child reference" if "reference" in local else "base reference"
+    assert (ws / "state.txt").read_text(encoding="utf-8") == expected
+
+
+@pytest.mark.parametrize("child_stage", ["s1", "new_stage"])
+def test_hidden_tests_merge_with_child_winning_clash(tmp_path, monkeypatch, child_stage):
+    base_dir, child_dir, _ = inherited_task(tmp_path, monkeypatch)
+    (base_dir / "hidden_tests" / "s1" / "test_clash.py").write_text(
+        "def test_replaced_base():\n    assert False\n", encoding="utf-8")
+    hidden = child_dir / "hidden_tests" / child_stage
+    hidden.mkdir(parents=True)
+    (hidden / "test_clash.py").write_text("def test_child_override():\n    assert True\n", encoding="utf-8")
+    (hidden / "test_child.py").write_text(
+        "from pathlib import Path\n\ndef test_child():\n"
+        "    assert Path('setup.txt').read_text(encoding='utf-8') == 'ready'\n"
+        "    assert Path('checks/pristine.txt').read_text(encoding='utf-8') == 'base'\n"
+        "    assert not Path('checks/extra.txt').exists()\n", encoding="utf-8")
+    (hidden / "ignored.py").write_text("raise RuntimeError('not a hidden test')\n", encoding="utf-8")
+    ws = tasks.make_workspace("tiny", tmp_path / "ws")
+    (ws / "state.txt").write_text("s1\n", encoding="utf-8")
+    (ws / "checks" / "pristine.txt").write_text("tampered", encoding="utf-8")
+    (ws / "checks" / "extra.txt").write_text("extra", encoding="utf-8")
+    expected = {"test_child_override": True, "test_child": True}
+    if child_stage == "s1":
+        expected["test_state"] = True
+    assert tasks.evaluate("child", child_stage, ws) == {"passed": True, "checks": expected}
+    if child_stage == "new_stage":  # a stage with no child directory still inherits its base files
+        result = tasks.evaluate("child", "final", ws)
+        assert result == {"passed": False, "checks": {"test_state": False}}
+
+
+def test_unbased_task_keeps_hidden_support_files(tmp_path, monkeypatch):
+    tiny_task(tmp_path, monkeypatch, [{"id": "s1", "prompt": "one", "max_steps": 3}])
+    hidden = tasks.TASKS_DIR / "tiny" / "hidden_tests" / "s1"
+    (hidden / "support.py").write_text("VALUE = 'support'\n", encoding="utf-8")
+    (hidden / "test_support.py").write_text(
+        "from support import VALUE\n\ndef test_support():\n    assert VALUE == 'support'\n", encoding="utf-8")
+    ws = tasks.make_workspace("tiny", tmp_path / "ws")
+    (ws / "state.txt").write_text("s1\n", encoding="utf-8")
+    assert tasks.evaluate("tiny", "s1", ws) == {
+        "passed": True, "checks": {"test_state": True, "test_support": True}}
+
+
+@pytest.mark.parametrize("child_memory", [None, "child memory", ""])
+def test_oracle_memory_inherits_with_child_precedence(tmp_path, monkeypatch, child_memory):
+    _, child_dir, chat = inherited_task(tmp_path, monkeypatch)
+    if child_memory is not None:
+        (child_dir / "oracle_memory.txt").write_text(child_memory, encoding="utf-8")
+    out = tmp_path / "out"
+    run.run_experiment("child", ["oracle"], 1, 4096, 700, out, chat)
+    [row] = rows(out)
+    assert row["valid"] and row["passed"]
+    assert row["memory"] == (child_memory if child_memory is not None else "base memory")
+    assert row["sleep_cost"]["calls"] == 0 and row["practice_log"] == []
+
+
+def test_two_level_inheritance_is_rejected_before_model(tmp_path, monkeypatch):
+    base_dir, _, _ = inherited_task(tmp_path, monkeypatch)
+    base = json.loads((base_dir / "task.json").read_text(encoding="utf-8"))
+    base["base"] = "child"
+    (base_dir / "task.json").write_text(json.dumps(base), encoding="utf-8")
+
+    def no_chat(*args, **kwargs):
+        pytest.fail("two-level inheritance reached the model")
+    with pytest.raises(ValueError, match="base|inherit"):
+        tasks.load_task("child")
+    with pytest.raises(ValueError, match="base|inherit"):
+        run.run_experiment("child", ["workspace"], 1, 4096, 700, tmp_path / "out", no_chat)
+
+
 def test_perfect_agent_gives_a_valid_wake_and_passes_every_design(tmp_path, monkeypatch):
     monkeypatch.setenv("DW_MODEL", "fake-model")
     out = tmp_path / "out"
@@ -607,7 +890,7 @@ def test_an_existing_results_file_is_never_appended_to(tmp_path):
 
 def test_an_evaluator_error_during_the_wake_aborts_instead_of_failing_the_wake(tmp_path, monkeypatch):
     monkeypatch.setattr(run.tasks, "evaluate", lambda *a, **k: {"passed": False, "checks": {}, "error": "gen boom"})
-    sessions = {s["id"]: s for s in tasks.load_task(TASK)["sessions"]}
+    sessions = tasks.load_task(TASK)["sessions"]
     chat = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")})
     with pytest.raises(RuntimeError, match="gen boom"):
         run._wake(TASK, sessions, tmp_path, 0, chat, 4096, 700, 3)

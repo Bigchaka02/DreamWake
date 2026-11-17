@@ -1,0 +1,23 @@
+{
+  "id": "settings_resume",
+  "base": "settings_gen",
+  "sessions": [
+    {
+      "id": "s1",
+      "prompt": "tests/test_client.py is failing. The HTTP client needs a configurable request timeout of 30 seconds, as a setting named TIMEOUT_S, exposed through `client.request_timeout_seconds()` returning 30.0. Make the checks pass.",
+      "max_steps": 20
+    },
+    {
+      "id": "s2",
+      "stage": null,
+      "prompt": "Policy change from the team. This replaces the earlier decision to store durations in seconds: every duration setting is now stored in milliseconds, and its name ends in _MS. Rename TIMEOUT_S to TIMEOUT_MS with value 30000. `client.request_timeout_seconds()` must still return 30.0. Make the checks pass.",
+      "max_steps": 6
+    },
+    {
+      "id": "final",
+      "stage": "s2",
+      "prompt": "Continue the unfinished work from your previous session and finish it. Make the checks pass.",
+      "max_steps": 20
+    }
+  ]
+}
