@@ -236,15 +236,18 @@ def _practise(design, items, practice, chat, window, reserve, seed, cost):
         exercises += [real] * (EXERCISES - len(exercises))
     first = [attempt(exercise, items) for exercise in exercises]
     record = {"exercises": [{**exercise, "score": result["score"], "score2": None, "check_passed": result["passed"],
-                             "check_passed2": None} for exercise, result in zip(exercises, first)],
-              "refined": False, "accepted": False}
+                             "check_passed2": None, "missing": result["missing"], "present": result["present"],
+                             "missing2": None, "present2": None} for exercise, result in zip(exercises, first)],
+              "items_before": [item.copy() for item in items], "candidate": None, "refined": False, "accepted": False}
     failed = [(exercise, result) for exercise, result in zip(exercises, first) if result["score"]]
     if not failed:
         return items, record
     candidate = _capped(parse_items(ask(_refine_prompt(items, *failed[0], budget))))
+    record["candidate"] = candidate
     second = [attempt(exercise, candidate) for exercise in exercises]
     for entry, result in zip(record["exercises"], second):
         entry["score2"], entry["check_passed2"] = result["score"], result["passed"]
+        entry["missing2"], entry["present2"] = result["missing"], result["present"]
     before, after = [r["score"] for r in first], [r["score"] for r in second]
     record["refined"] = True
     record["accepted"] = (all(a <= b for a, b in zip(after, before)) and sum(after) < sum(before)

@@ -408,9 +408,53 @@ def test_scores_of_zero_make_no_refine_call_and_run_exactly_two_sessions_with_th
     assert not instruction_prompts(fake, designs.REFINE_INSTRUCTION) and len(spy) == 2
     assert cost["practice_sessions"] == 2 and cost["calls"] == 2
     entry = {"request": REAL, "hypothetical": False, "must_add": [], "must_not_add": [], "score": 0, "score2": None,
-             "check_passed": True, "check_passed2": None}
+             "check_passed": True, "check_passed2": None, "missing": [], "present": [], "missing2": None,
+             "present2": None}
     assert artifact == {"items": ITEMS, "practice": [{"exercises": [entry, entry], "refined": False,
-                                                      "accepted": False}]}
+                                                      "accepted": False, "items_before": ITEMS, "candidate": None}]}
+
+
+@pytest.mark.parametrize("design", ["replay", "dreaming"])
+def test_practice_record_without_failures_keeps_a_copy_and_no_candidate(tmp_path, design):
+    items = [item.copy() for item in ITEMS]
+    cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+    fake = practice_chat(writes=[("notes.txt", "POLL_MS = 1")])
+    kept, record = designs._practise(design, items, snapshots(tmp_path), fake, 4096, 700, None, cost)
+    assert kept is items and record["items_before"] == ITEMS
+    assert record["items_before"] is not items
+    assert all(before is not original for before, original in zip(record["items_before"], items))
+    assert record["candidate"] is None and not record["refined"] and not record["accepted"]
+    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
+        ([], [], None, None)] * 2
+    items[0]["text"] = "changed after practice"
+    items.append({"kind": "rule", "text": "added after practice"})
+    assert record["items_before"] == ITEMS
+
+
+def test_practice_record_keeps_the_capped_parsed_accepted_candidate_and_both_attempts(tmp_path, spy):
+    extra = [("rule", f"extra {i}") for i in range(8)]
+    fake = practice_chat(refine="junk\n" + lines(SPECIFIC, LESSON, *extra),
+                         writes=scored({(0, False): 2, (1, False): 0, (0, True): 0, (1, True): 0}))
+    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
+    [record] = artifact["practice"]
+    expected = REFINED + [{"kind": kind, "text": text} for kind, text in extra[:6]]
+    assert record["items_before"] == ITEMS and record["candidate"] == expected
+    assert record["refined"] and record["accepted"] and artifact["items"] == expected
+    assert [s["memory"] for s in spy[2:]] == [designs.inject("consolidated", {"items": expected})] * 2
+    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
+        (["_MS"], ["_SECONDS"], [], []), ([], [], [], [])]
+
+
+@pytest.mark.parametrize("candidate", [REFINED, REFINED[:1], []])
+def test_practice_record_keeps_rejected_candidates_including_empty_and_both_attempts(tmp_path, spy, candidate):
+    fake = practice_chat(refine=json.dumps(candidate), writes=[("notes.txt", "POLL_SECONDS = 1")])
+    artifact, _ = sleep("dreaming", fake, snapshots(tmp_path))
+    [record] = artifact["practice"]
+    assert record["items_before"] == ITEMS and record["candidate"] == candidate
+    assert record["refined"] and not record["accepted"] and artifact["items"] == ITEMS
+    assert [s["memory"] for s in spy[2:]] == [designs.inject("consolidated", {"items": candidate})] * 2
+    assert [(e["missing"], e["present"], e["missing2"], e["present2"]) for e in record["exercises"]] == [
+        (["_MS"], ["_SECONDS"], ["_MS"], ["_SECONDS"])] * 2
 
 
 def test_a_failing_exercise_triggers_one_refine_and_two_more_sessions_with_the_candidate(tmp_path, spy):

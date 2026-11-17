@@ -146,10 +146,11 @@ def test_dreaming_and_replay_practise_on_snapshots_of_the_wake_and_log_it(tmp_pa
         assert result[design]["practice_log"] == [] and result[design]["contamination"] == []
     replay, dreaming = result["replay"]["practice_log"], result["dreaming"]["practice_log"]
     assert len(replay) == len(dreaming) == 2  # one record per sleep, s1 first
-    assert all(set(r) == {"exercises", "refined", "accepted"} and len(r["exercises"]) == 2 for r in replay + dreaming)
+    assert all(set(r) == {"exercises", "refined", "accepted", "items_before", "candidate"}
+               and len(r["exercises"]) == 2 for r in replay + dreaming)
     entries = [(r, e) for r in replay + dreaming for e in r["exercises"]]
     assert all(set(e) == {"request", "hypothetical", "must_add", "must_not_add", "score", "score2", "check_passed",
-                          "check_passed2"} for _, e in entries)
+                          "check_passed2", "missing", "present", "missing2", "present2"} for _, e in entries)
     assert [[e["request"] for e in r["exercises"]] for r in replay] == [[prompts["s1"]] * 2, [prompts["s2"]] * 2]
     assert [(e["score"], e["score2"], e["check_passed"]) for r in replay for e in r["exercises"]] == [
         (0, None, True)] * 4  # the scripted agent passes its real sessions
