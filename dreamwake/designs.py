@@ -59,6 +59,7 @@ REVIEW_INSTRUCTION = (
     "most 35 words). If the rules already cover every standing decision, answer with number -1 and an empty "
     "text.")
 NOTE_CAP = 900  # characters of injected memory, for every design
+STATE_DONE_CAP, STATE_OPEN_CAP = 160, 400
 ITEM_CAP, TEXT_CAP = 8, 240
 REPLACES, REPLACES_CAP = "(replaces:", 60  # a longer or unterminated "(replaces: ...)" copies an old rule
 FRAMING_TOKENS = 50  # chat-template tokens around the single message, by estimate
@@ -338,6 +339,11 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
         return (reply["content"] or "").strip()[:NOTE_CAP], cost
     if design == "consolidated":
         return _consolidate(artifact, events, chat, window, reserve, seed)
+    if design == "hybrid":
+        artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
+        # first line only: a multi-call finish carries the ignored-calls note after it
+        finished = any(e["type"] == "result" and e["text"].split("\n")[0] == "finished" for e in events)
+        return {"items": artifact["items"], "state": {"request": events[0]["text"], "finished": finished}}, cost
     if design == "review":
         artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
         items = artifact["items"]
@@ -388,7 +394,18 @@ def inject(design, artifact):
             kept.append(prefix + text)
             remaining -= len(prefix + text) + (1 if len(kept) > 1 else 0)
         return "\n".join(reversed(kept))
-    if design in ("consolidated", "dreaming", "replay", "review"):  # offline requests are never injected
+    if design in ("consolidated", "dreaming", "replay", "review", "hybrid"):  # offline requests are never injected
         items = artifact["items"] if artifact else []
-        return "\n".join(f"- {item['kind'].upper()}: {item['text']}" for item in items)
+        lines = [f"- {item['kind'].upper()}: {item['text']}" for item in items]
+        if design == "hybrid" and artifact:
+            state = artifact["state"]
+            request = state["request"].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+            cap = STATE_DONE_CAP if state["finished"] else STATE_OPEN_CAP
+            if len(request) > cap:
+                request = request[:cap - len(" [...]")] + " [...]"
+            status = "finished" if state["finished"] else "NOT finished - continue this work"
+            lines.insert(0, f"- LAST SESSION ({status}): {request}")
+            while len("\n".join(lines)) > NOTE_CAP:
+                lines.pop()
+        return "\n".join(lines)
     raise ValueError(f"unknown design: {design!r}")

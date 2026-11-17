@@ -403,6 +403,60 @@ def test_only_the_first_tool_call_of_a_reply_is_executed(ws):
     assert [e["type"] for e in result["events"]].count("call") == 2
 
 
+@pytest.mark.parametrize("count", [1, 2, 3])
+@pytest.mark.parametrize("bad_first", [False, True])
+def test_ignored_calls_notice(ws, tmp_path, count, bad_first):
+    first = ("read_file", None) if bad_first else ("write_file", {"path": "one.txt", "content": "1"})
+    ignored = [("write_file", {"path": f"ignored{i}.txt", "content": "x"}) for i in range(count - 1)]
+    fake = StrictServerChat([reply(first, *ignored, content="doing both"), FINISH])
+    log = tmp_path / "session.jsonl"
+    result = agent.run_session(TASK, ws, PROMPT, chat=fake, max_steps=10, window=100_000, reserve=500,
+                               log_path=log)
+    own_output = ("error: the arguments for read_file are not a valid JSON object" if bad_first
+                  else "wrote 1 characters to one.txt")
+    note = (f"[note: only your first tool call was run; {count - 1} more in the same reply were ignored. "
+            "Call one tool per step.]")
+    expected = own_output + ("\n" + note if count > 1 else "")
+    assert results(result) == [expected, "finished"]
+    assert result["ignored_calls"] == count - 1
+    call, finish = [e for e in result["events"] if e["type"] == "call"]
+    assert call.get("ignored_calls", 0) == count - 1
+    assert ("ignored_calls" in call) is (count > 1) and "ignored_calls" not in finish
+    assert (ws / "one.txt").exists() is (not bad_first)
+    assert not any(ws.glob("ignored*.txt"))
+    assistant, tool = fake.calls[1]["messages"][2:]
+    assert len(assistant["tool_calls"]) == 1
+    replay = assistant["tool_calls"][0]
+    assert json.loads(replay["function"]["arguments"]) == ({"raw": "{bad"} if bad_first else first[1])
+    assert tool == {"role": "tool", "tool_call_id": replay["id"], "content": expected}
+    logged = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [e for e in logged if e["type"] != "step"] == result["events"]
+
+
+@pytest.mark.parametrize("gate", [False, True])
+def test_ignored_finish_calls(ws, gate):
+    multi = reply(("finish", {"summary": "done"}),
+                  ("write_file", {"path": "ignored.txt", "content": "x"}), ("list_files", {}))
+    result, fake = run(ws, [multi, multi], memory="note", finish_gate=gate)
+    note = ("\n[note: only your first tool call was run; 2 more in the same reply were ignored. "
+            "Call one tool per step.]")
+    assert results(result) == ([agent.GATE.format(memory="note") + note] if gate else []) + ["finished" + note]
+    assert result["finished"] and result["gated"] is gate and result["ended_by"] == "finish"
+    assert result["steps"] == len(fake.calls) == (2 if gate else 1)
+    assert result["ignored_calls"] == (4 if gate else 2)
+    assert all(e["ignored_calls"] == 2 for e in result["events"] if e["type"] == "call")
+    assert not (ws / "ignored.txt").exists()
+    if gate:
+        assert fake.calls[1]["messages"][-1]["content"] == agent.GATE.format(memory="note") + note
+
+
+def test_ignored_calls_total(ws):
+    calls = [("list_files", {}), ("finish", {"summary": "ignored"}), ("read_file", {"path": "ignored"})]
+    result, _ = run(ws, [reply(*calls[:2]), reply(content="thinking"), reply(*calls), FINISH])
+    assert result["ignored_calls"] == 3 and result["finished"] and result["steps"] == 4
+    assert [e.get("ignored_calls", 0) for e in result["events"] if e["type"] == "call"] == [1, 2, 0]
+
+
 def test_reply_without_a_tool_call_is_nudged_and_two_in_a_row_end_the_session(ws):
     result, fake = run(ws, [reply(content="thinking"), reply(("list_files", {})),
                             reply(content="hmm"), reply(content="still hmm"), FINISH])

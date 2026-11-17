@@ -380,6 +380,97 @@ def test_consolidated_instruction_texts():
     assert designs.MERGE_INSTRUCTION.endswith("At most 8 items. Output only the JSON lines.")
 
 
+# --- hybrid ---------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tail, finished", [
+    ([], False),
+    ([{"type": "result", "step": 31, "text": "finished"}], True),
+    ([{"type": "result", "step": 31, "text": "finished"},
+      {"type": "result", "step": 32, "text": "later"}], True),
+    ([{"type": "say", "step": 31, "text": "finished"}], False),
+    ([{"type": "result", "step": 31, "text": "finished "}], False),
+    ([{"type": "result", "step": 31, "text": "finished\n" + agent.IGNORED.format(n=1)}], True),
+])
+def test_hybrid_sleep(tail, finished):
+    request = "  Exact request\r\nwith lines\nand spaces.  "
+    events = session_events(30, request) + tail
+    old = {"items": [{"kind": "rule", "text": SECONDS[1]}],
+           "state": {"request": "OLD STATE", "finished": True}}
+    hybrid_chat = memory_chat(lines(MILLIS), lines(MILLIS, LESSON))
+    base_chat = memory_chat(lines(MILLIS), lines(MILLIS, LESSON))
+    artifact, cost = designs.sleep("hybrid", old, events, chat=hybrid_chat, window=1000, reserve=300, seed=42,
+                                   practice={"requests": [request]})
+    base, base_cost = designs.sleep("consolidated", old, events, chat=base_chat, window=1000, reserve=300, seed=42)
+    assert artifact == {"items": base["items"], "state": {"request": request, "finished": finished}}
+    assert hybrid_chat.calls == base_chat.calls and len(hybrid_chat.calls) > 2 and cost == base_cost
+    assert prompts(hybrid_chat)[-1].startswith(f"CURRENT memory:\n{lines(SECONDS)}\n\nNEW items:")
+    assert "OLD STATE" not in "\n".join(prompts(hybrid_chat))
+
+
+@pytest.mark.parametrize("first_finished", [False, True])
+def test_hybrid_latest_state(first_finished):
+    first_events = session_events(1, "  first\nrequest  ")
+    second_events = session_events(1, "second\r\nrequest")
+    done = {"type": "result", "step": 2, "text": "finished"}
+    (first_events if first_finished else second_events).append(done)
+    first, _ = designs.sleep("hybrid", None, first_events, chat=memory_chat(lines(SECONDS), lines(SECONDS)),
+                             window=4096, reserve=700)
+    saved = json.loads(json.dumps(first))
+    fake = memory_chat(lines(MILLIS), lines(MILLIS, LESSON))
+    second, _ = designs.sleep("hybrid", first, second_events, chat=fake, window=4096, reserve=700)
+    assert first == saved
+    assert first["state"] == {"request": first_events[0]["text"], "finished": first_finished}
+    assert second == {"items": [{"kind": k, "text": t} for k, t in (MILLIS, LESSON)],
+                      "state": {"request": second_events[0]["text"], "finished": not first_finished}}
+    assert prompts(fake)[-1].startswith(f"CURRENT memory:\n{lines(SECONDS)}\n\nNEW items:")
+    rendered = designs.inject("hybrid", second)
+    prefix = "- LAST SESSION (NOT finished - continue this work): " if first_finished else "- LAST SESSION (finished): "
+    assert rendered == prefix + "second request\n" + designs.inject("consolidated", second)
+
+
+@pytest.mark.parametrize("finished, cap", [(True, 160), (False, 400)])
+@pytest.mark.parametrize("extra", [-1, 0, 1, 1000])
+def test_hybrid_state_caps(finished, cap, extra):
+    assert (designs.STATE_DONE_CAP, designs.STATE_OPEN_CAP) == (160, 400)
+    start = "  first\r\nsecond\rthird\n  "
+    flat_start = "  first second third   "
+    request = start + "x" * (cap + extra - len(flat_start))
+    flat = flat_start + "x" * (cap + extra - len(flat_start))
+    artifact = {"items": [], "state": {"request": request, "finished": finished}}
+    prefix = "- LAST SESSION (finished): " if finished else "- LAST SESSION (NOT finished - continue this work): "
+    expected = flat[:cap - len(" [...]")] + " [...]" if extra > 0 else flat
+    assert designs.inject("hybrid", artifact) == prefix + expected
+    assert len(expected) == min(cap, len(flat))
+    assert artifact["state"]["request"] == request
+
+
+@pytest.mark.parametrize("finished, cap, count", [(True, 160, 3), (False, 400, 2)])
+@pytest.mark.parametrize("extra", [-1, 0, 1])
+def test_hybrid_note_cap(finished, cap, count, extra):
+    prefix = "- LAST SESSION (finished): " if finished else "- LAST SESSION (NOT finished - continue this work): "
+    state_line = prefix + "s" * cap
+    items = [{"kind": "rule", "text": str(i) * 240} for i in range(count - 1)]
+    before = state_line + "\n" + designs.inject("consolidated", {"items": items})
+    remaining = designs.NOTE_CAP - len(before + "\n- LESSON: ")
+    items += [{"kind": "lesson", "text": "last " + "z" * (remaining + extra - len("last "))},
+              {"kind": "rule", "text": "drop this rule"}]
+    artifact = {"items": items, "state": {"request": "s" * cap, "finished": finished}}
+    saved = json.loads(json.dumps(artifact))
+    kept = count if extra <= 0 else count - 1
+    expected = state_line + "\n" + designs.inject("consolidated", {"items": items[:kept]})
+    rendered = designs.inject("hybrid", artifact)
+    assert rendered == expected and len(rendered) <= designs.NOTE_CAP
+    assert len(rendered + "\n" + designs.inject("consolidated", {"items": [items[kept]]})) > designs.NOTE_CAP
+    if extra <= 0:
+        assert len(rendered) == designs.NOTE_CAP + extra
+    assert artifact == saved
+
+
+@pytest.mark.parametrize("artifact", [None, {}, "", []])
+def test_hybrid_empty(artifact):
+    assert designs.inject("hybrid", artifact) == ""
+
+
 # --- dreaming and replay: practise with the memory, keep a rewrite only if practice improves -------
 
 TASK = "settings_gen"

@@ -15,6 +15,8 @@ MARKER = "[earlier steps omitted to fit the context window]"
 NUDGE = "Use a tool. Call finish when the work is done."
 GATE = ("Not finished yet. First check your changes against each of these notes, one by one:\n"
         "{memory}\nIf a change breaks a note, fix it and run the checks again. Then call finish.")
+IGNORED = ("[note: only your first tool call was run; {n} more in the same reply were ignored. "
+           "Call one tool per step.]")
 READ_CAP = 3000
 RENDER_CAP = 600
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
@@ -100,6 +102,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "max_prompt_tokens": 0}
     steps, finished, silent, overflow, start = 0, False, 0, False, time.perf_counter()
     gated = False
+    ignored_calls = 0
     known, ratio = set(), 1.0  # ratio: the server's prompt token count over our estimate, once measured
     try:
         while steps < max_steps and not finished and silent < 2:
@@ -149,6 +152,11 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
                 if finished and finish_gate and memory and not gated:
                     text = GATE.format(memory=memory)
                     finished, gated = False, True
+                ignored = len(reply["tool_calls"]) - 1
+                if ignored:
+                    ignored_calls += ignored
+                    event["ignored_calls"] = ignored
+                    text += "\n" + IGNORED.format(n=ignored)
                 new = [event, {"type": "result", "step": steps, "text": text}]
                 # LM Studio rejects (HTTP 500) or garbles a replayed call whose arguments are not a JSON object
                 units.append([{"role": "assistant", "content": content, "tool_calls": [
@@ -168,6 +176,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
             Path(log_path).write_text("".join(json.dumps(line) + "\n" for line in log), encoding="utf-8")
     ended_by = "finish" if finished else "overflow" if overflow else "no_tool_calls" if silent >= 2 else "max_steps"
     return {"finished": finished, "gated": gated, "steps": steps, "ended_by": ended_by,
+            "ignored_calls": ignored_calls,
             "ran_out_of_steps": ended_by == "max_steps", "overflow": overflow,
             "events": events, **totals, "seconds": time.perf_counter() - start, "dropped_units": dropped}
 

@@ -26,7 +26,7 @@ def parse_design(spec):
     if plus and suffix != "gate":
         raise ValueError(f"unknown design suffix: {suffix!r}; expected '+gate'")
     store, at, placement = base.partition("@")
-    if store not in ("workspace", "handoff", "consolidated", "replay", "dreaming", "oracle", "requests", "review"):
+    if store not in ("workspace", "handoff", "consolidated", "replay", "dreaming", "oracle", "requests", "review", "hybrid"):
         raise ValueError(f"unknown store: {store!r}")
     if at and placement not in ("system", "request", "tail"):
         raise ValueError(f"unknown placement: {placement!r}")
@@ -147,7 +147,7 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
         shutil.move(workspace, archive)
         rows.append({"repeat": r, "checks": evaluation["checks"], "passed": evaluation["passed"],
                      "eval_error": evaluation.get("error"), "steps": result["steps"], "ended_by": result["ended_by"],
-                     "gated": result["gated"],
+                     "gated": result["gated"], "ignored_calls": result["ignored_calls"],
                      "ran_out_of_steps": result["ran_out_of_steps"], "overflow": result["overflow"],
                      "repeated_mistake": repeated, "prompt_tokens": result["prompt_tokens"],
                      "completion_tokens": result["completion_tokens"], "max_prompt_tokens": result["max_prompt_tokens"],

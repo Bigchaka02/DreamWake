@@ -25,6 +25,13 @@ def test_parse_design_workspace():
     assert run.parse_design("workspace") == ("workspace", "system", False)
 
 
+@pytest.mark.parametrize("placement", [None, "system", "request", "tail"])
+@pytest.mark.parametrize("gate", [False, True])
+def test_hybrid_specs(placement, gate):
+    spec = "hybrid" + ("@" + placement if placement else "") + ("+gate" if gate else "")
+    assert run.parse_design(spec) == ("hybrid", placement or "system", gate)
+
+
 @pytest.mark.parametrize("spec", ["", "nearby", "unknown", "handoff@", "handoff@user", "handoff@SYSTEM",
     "handoff+", "handoff+check", "handoff+gate+gate", "handoff@tail+gate+extra", "handoff@@tail",
     "handoff@tail@system", "handoff+gate@tail", "handoff@tail+", "handoff@tail+check", "handoff ",
@@ -272,6 +279,35 @@ def test_review_logs_each_sleep_in_order_and_reuses_logs_for_final_repeats(tmp_p
                                       "seconds": consolidated["sleep_cost"]["seconds"] + 2.0}
 
 
+@pytest.mark.parametrize("cutoff", [False, True])
+def test_hybrid_rows(tmp_path, monkeypatch, cutoff):
+    sessions = [{"id": "s1", "stage": None, "prompt": "Earlier request", "max_steps": 3},
+                {"id": "s2", "stage": None, "prompt": "  Latest\r\nrequest  ", "max_steps": 2 if cutoff else 3},
+                {"id": "final", "prompt": "end", "max_steps": 3}]
+    inner = tiny_task(tmp_path, monkeypatch, sessions)
+    calls = []
+    items = [{"kind": "rule", "text": "Keep the base policy."}]
+
+    def chat(messages, tools=None, **kwargs):
+        if tools is not None:
+            return inner(messages, tools, **kwargs)
+        calls.append((messages, kwargs))
+        return {"content": json.dumps(items), "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "seconds": 1.0}
+
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["consolidated", "hybrid"], 1, 4096, 700, out, chat, final_repeats=2)
+    base, _, hybrid, repeated = rows(out)
+    prefix = "- LAST SESSION (NOT finished - continue this work): " if cutoff else "- LAST SESSION (finished): "
+    assert hybrid["memory"] == prefix + "  Latest request  \n" + base["memory"]
+    assert hybrid["memory"] == repeated["memory"] and hybrid["store"] == "hybrid"
+    assert hybrid["sleep_cost"] == base["sleep_cost"] and calls[:4] == calls[4:]
+    assert len(calls) == 8
+    assert hybrid["memory_tokens"] == llm.estimate_tokens(agent.MEMORY.format(memory=hybrid["memory"]))
+    assert hybrid["memory"] in inner.starts[-1][0][0]["content"]
+    assert all(row["passed"] and row["practice_log"] == row["review_log"] == [] for row in rows(out))
+    assert not list((out / "seed0").glob("practice_*"))
+
+
 @pytest.mark.parametrize("stages, passing, valid", [
     (["early", "later", None], {"early": False, "later": True}, True),
     (["early", "later", None], {"early": True, "later": False}, False),
@@ -332,6 +368,27 @@ def test_final_row_records_finish_gate(tmp_path, monkeypatch, spec, gated):
     run.run_experiment("tiny", [spec], 1, 4096, 700, out, chat)
     [row] = rows(out)
     assert row["passed"] and row["gated"] is gated
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_ignored_calls_row(tmp_path, monkeypatch, count):
+    sessions = [{"id": "s1", "prompt": "one", "max_steps": 3},
+                {"id": "final", "prompt": "end", "max_steps": 3}]
+    inner = tiny_task(tmp_path, monkeypatch, sessions)
+
+    def chat(messages, tools=None, **kwargs):
+        response = inner(messages, tools, **kwargs)
+        response["tool_calls"] += [{"name": "write_file", "arguments": {"path": "ignored.txt", "content": "x"},
+                                    "raw": "{}"}] * (count - 1)
+        return response
+
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["workspace"], 1, 4096, 700, out, chat, final_repeats=2)
+    assert len(rows(out)) == 2
+    for row in rows(out):
+        assert row["passed"] and row["ignored_calls"] == 3 * (count - 1)
+        assert not (out / "seed0" / ("final_workspace_ws" + (".r1" if row["repeat"] else ""))
+                    / "ignored.txt").exists()
 
 
 def inherited_task(tmp_path, monkeypatch):
@@ -566,7 +623,7 @@ def test_request_spec_uses_safe_labels_and_preserves_design(tmp_path):
 
 
 @pytest.mark.parametrize("spec", ["handoff+gate", "oracle@request+gate", "requests@tail+gate",
-                                 "replay@request+gate", "dreaming@tail+gate"])
+                                 "replay@request+gate", "dreaming@tail+gate", "hybrid@tail+gate"])
 def test_specs_wire_final_and_practice_placement_and_gate_with_safe_paths(tmp_path, monkeypatch, spec):
     store, placement, gate = run.parse_design(spec)
     label = spec.replace("@", "_at_").replace("+", "_")
