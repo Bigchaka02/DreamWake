@@ -1,0 +1,4 @@
+{
+  "ping": "cmd_ping",
+  "whoami": "cmd_whoami"
+}

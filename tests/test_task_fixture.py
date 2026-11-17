@@ -39,6 +39,7 @@ def test_task_json_describes_three_sessions():
     assert task["check_cmd"][0] == "python tools/gen.py"
     assert task["trap_paths"] == ["src/settings.py"]
     assert task["protected"] == ["tests", "tools"]
+    assert task["eval_setup"] == ["python tools/gen.py"]
     assert [s["max_steps"] for s in task["sessions"]] == [20, 20, 20]
 
 
@@ -153,6 +154,21 @@ def test_evaluate_reports_a_broken_workspace_instead_of_raising(ws):
     assert result["passed"] is False
     assert result["checks"] == {name: False for name in FINAL_CHECKS}
     assert result["error"]
+
+
+def test_a_failing_eval_setup_command_yields_the_error_result(ws, tmp_path, monkeypatch):
+    tasks_dir = tmp_path / "tasks"
+    shutil.copytree(tasks.TASKS_DIR / TASK, tasks_dir / TASK)
+    task_json = tasks_dir / TASK / "task.json"
+    task = json.loads(task_json.read_text(encoding="utf-8"))
+    task["eval_setup"] = ["python tools/gen.py", "python tools/no_such_step.py"]
+    task_json.write_text(json.dumps(task), encoding="utf-8")
+    monkeypatch.setattr(tasks, "TASKS_DIR", tasks_dir)
+    tasks.apply_reference(TASK, "s1", ws)
+    result = tasks.evaluate(TASK, "s1", ws)
+    assert result["passed"] is False
+    assert result["checks"] == {"test_feature_works": False, "test_audit_ok": False}
+    assert result["error"].startswith("python tools/no_such_step.py failed: ")
 
 
 def test_run_check_output_is_capped_and_keeps_the_tail(ws):

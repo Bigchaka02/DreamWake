@@ -7,6 +7,7 @@
   ],
   "trap_paths": ["src/settings.py"],
   "protected": ["tests", "tools"],
+  "eval_setup": ["python tools/gen.py"],
   "sessions": [
     {
       "id": "s1",

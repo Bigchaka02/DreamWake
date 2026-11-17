@@ -1,0 +1,6 @@
+{
+  "ping": "cmd_ping",
+  "whoami": "cmd_whoami",
+  "hello": "cmd_hello",
+  "version": "version"
+}

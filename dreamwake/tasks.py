@@ -98,9 +98,10 @@ def evaluate(task_id, stage, workspace_dir, baseline_dir=None, timeout_s=120):
             shutil.rmtree(work / name, ignore_errors=True)
             _copy(task["workspace"] / name, work / name)
         _copy(hidden, Path(tmp) / "hidden")
-        code, out = _run([sys.executable, "tools/gen.py"], work, timeout_s)
-        if code != 0:
-            return {"passed": False, "checks": checks, "error": "gen failed: " + out[-500:]}
+        for command in task.get("eval_setup", []):  # e.g. regenerate derived files before scoring
+            code, out = _run([sys.executable] + command.split()[1:], work, timeout_s)
+            if code != 0:
+                return {"passed": False, "checks": checks, "error": f"{command} failed: " + out[-500:]}
         xml = Path(tmp) / "junit.xml"
         code, out = _run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                           "--junitxml", str(xml), str(Path(tmp) / "hidden")], work, timeout_s, **env)

@@ -1,0 +1,8 @@
+{
+  "s1": null,
+  "s2": "s1",
+  "final": "s2",
+  "trap": "s2",
+  "stale": "s2",
+  "no_convention": "s2"
+}
