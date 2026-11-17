@@ -45,10 +45,19 @@ def make_workspace(task_id, dest_dir):
 
 def apply_reference(task_id, name, workspace_dir):
     """Write reference state `name` (and the states it builds on) over a snapshot workspace."""
-    reference = load_task(task_id)["reference"]
-    parent = json.loads((reference / "parents.json").read_text(encoding="utf-8"))[name]
+    task = load_task(task_id)
+    references = [task["dir"] / "reference"]
+    if "base" in task:
+        references.append(TASKS_DIR / task["base"] / "reference")
+    parents = {}
+    for reference in reversed(references):
+        path = reference / "parents.json"
+        if path.exists():
+            parents.update(json.loads(path.read_text(encoding="utf-8")))
+    parent = parents[name]
     if parent:
         apply_reference(task_id, parent, workspace_dir)
+    reference = next((root for root in references if (root / name).is_dir()), references[0])
     _copy(reference / name, workspace_dir)
 
 

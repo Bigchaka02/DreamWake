@@ -1,0 +1,6 @@
+{
+  "RETRIES": {"type": "int", "value": 3},
+  "BASE_URL": {"type": "str", "value": "http://localhost"},
+  "TIMEOUT_MS": {"type": "int", "value": 30000},
+  "SERVICE_NAME": {"type": "str", "value": "dreamwake", "doc": "Name of the service used by the client."}
+}
