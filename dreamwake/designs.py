@@ -38,9 +38,10 @@ DREAM_INSTRUCTION = (
     "just in that one task. Find the standing decisions that no automatic check would enforce.\n"
     "Write up to 4 practice exercises. Each exercise tests ONE standing decision:\n"
     "- \"decision\": the user's sentence that states it, copied character for character from the requests above.\n"
-    "- \"request\": a small new feature request of the kind this user makes, to which the decision clearly "
-    "applies. Write it the way a teammate who never saw the decision would: plain everyday words, in the old or "
-    "everyday terms, nothing about how to store or name things, no file names, no setting names, no suffixes.\n"
+    "- \"request\": a small new feature request of the kind this user makes, for something that none of the "
+    "requests above already asked for, to which the decision clearly applies. Write it the way a teammate who "
+    "never saw the decision would: plain everyday words, in the old or everyday terms, nothing about how to store "
+    "or name things, no file names, no setting names, no suffixes.\n"
     "- \"must_add\": 1 or 2 short strings copied character for character from the decision (for example a "
     "required suffix) that will appear in the text added to the project if the decision is followed.\n"
     "- \"must_not_add\": short strings that would appear only if the decision were ignored. Never a whole "
@@ -69,6 +70,7 @@ FRAMING_TOKENS = 50  # chat-template tokens around the single message, by estima
 EXERCISES, EXPECT_CAP = 2, 4  # practice exercises per sleep; strings per must_add / must_not_add list
 CONTROL_CAP, CONFIRM, REPLAY_ATTEMPTS = 3, 2, 5
 REPLY_CAP, DECISION_MIN = 2000, 20
+DREAM_SUFFIX = " This is a new, separate feature: add it even if something similar already exists."
 ADDED_CAP, CHECK_TAIL = 800, 300  # characters of added text and of check output shown to the repair call
 
 
@@ -289,7 +291,9 @@ def _practise(design, items, practice, chat, window, reserve, seed, cost):
         cost["practice_sessions"] += 1
         shutil.rmtree(sandbox, ignore_errors=True)
         tasks._copy(snapshot, sandbox)  # never run in the snapshot itself
-        result = agent.run_session(practice["task_id"], sandbox, exercise["request"],
+        # the dream writer cannot see the project: without the suffix the agent answers "already there"
+        request = exercise["request"] + (DREAM_SUFFIX if exercise["hypothetical"] else "")
+        result = agent.run_session(practice["task_id"], sandbox, request,
                                    memory=memory_text, memory_at=memory_at, finish_gate=finish_gate,
                                    max_steps=practice["max_steps"], window=window, reserve=reserve, chat=chat,
                                    seed=fresh(practice["max_steps"] + 1), log_path=sandbox.with_suffix(".jsonl"))

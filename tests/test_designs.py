@@ -684,7 +684,8 @@ def test_controls_verify_in_order_stop_at_two_or_three_and_never_fallback(practi
     dreams = [{**DREAMS[0], "request": f"Make timer number {i}."} for i in range(4)]
     rejected = {**DREAMS[0], "request": "Edit bad.py."}
     def writes(request, memory, attempt):
-        index = [d["request"] for d in dreams].index(request)
+        assert request.endswith(designs.DREAM_SUFFIX)  # dreamed requests say the feature is new
+        index = [d["request"] for d in dreams].index(request.removesuffix(designs.DREAM_SUFFIX))
         score = scores[index] if "USER DECISION:" in memory else 0
         return [("notes.txt", WRITTEN[score])]
     artifact, cost = sleep("dreaming", practice_chat(dream=dream_reply(rejected, *dreams), writes=writes), practice)
@@ -737,7 +738,7 @@ def test_repair_edits_one_rule_and_requires_both_confirmations_and_other_not_wor
         elif SPECIFIC[1] in memory:
             score = second[attempt - 4]
         else:
-            score = 2 if request == DREAMS[0]["request"] else 0
+            score = 2 if request == DREAMS[0]["request"] + designs.DREAM_SUFFIX else 0
         return [("notes.txt", WRITTEN[score])]
     fake = practice_chat(writes=writes)
     practice.update(memory_at="tail", finish_gate=True)
@@ -752,7 +753,8 @@ def test_repair_edits_one_rule_and_requires_both_confirmations_and_other_not_wor
     assert [e["scores2"] for e in record["exercises"]] == [second[:2], second[2:]]
     assert record["exercises"][0]["missing"] == ["_MS"] and record["exercises"][0]["present"] == ["_SECONDS"]
     assert artifact["items"] == (REFINED if accepted else ITEMS) and cost["practice_sessions"] == 7
-    assert [s["request"] for s in spy[4:]] == [DREAMS[0]["request"]] * 2 + [DREAMS[1]["request"]]
+    assert [s["request"] for s in spy[4:]] == [d["request"] + designs.DREAM_SUFFIX
+                                               for d in (DREAMS[0], DREAMS[0], DREAMS[1])]
     assert all(s["memory"] == CANDIDATE and s["memory_at"] == "tail" and s["finish_gate"] for s in spy[4:])
     [call] = instruction_calls(fake, designs.REPAIR_INSTRUCTION)
     assert call["messages"][0]["content"] == (RULES + f"USER DECISION: {DECISION}\n\n"
@@ -944,9 +946,10 @@ def test_practice_constants_and_instruction_texts_are_pinned():
         "just in that one task. Find the standing decisions that no automatic check would enforce.\n"
         "Write up to 4 practice exercises. Each exercise tests ONE standing decision:\n"
         "- \"decision\": the user's sentence that states it, copied character for character from the requests above.\n"
-        "- \"request\": a small new feature request of the kind this user makes, to which the decision clearly "
-        "applies. Write it the way a teammate who never saw the decision would: plain everyday words, in the old or "
-        "everyday terms, nothing about how to store or name things, no file names, no setting names, no suffixes.\n"
+        "- \"request\": a small new feature request of the kind this user makes, for something that none of the "
+        "requests above already asked for, to which the decision clearly applies. Write it the way a teammate who "
+        "never saw the decision would: plain everyday words, in the old or everyday terms, nothing about how to store "
+        "or name things, no file names, no setting names, no suffixes.\n"
         "- \"must_add\": 1 or 2 short strings copied character for character from the decision (for example a "
         "required suffix) that will appear in the text added to the project if the decision is followed.\n"
         "- \"must_not_add\": short strings that would appear only if the decision were ignored. Never a whole "
