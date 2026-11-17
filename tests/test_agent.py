@@ -159,6 +159,27 @@ def test_system_prompt_states_the_step_budget_and_appends_memory(ws):
     assert fake.calls[0]["messages"][1] == {"role": "user", "content": PROMPT}
 
 
+@pytest.mark.parametrize("memory_at", ["system", "request"])
+@pytest.mark.parametrize("memory", ["", "durations use _MS"])
+def test_memory_placement(ws, tmp_path, memory_at, memory):
+    log = tmp_path / "session.jsonl"
+    result, fake = run(ws, [reply(("list_files", {})), FINISH], max_steps=7, memory=memory,
+                       memory_at=memory_at, log_path=log)
+    note = agent.MEMORY.format(memory=memory) if memory else ""
+    pinned = [{"role": "system", "content": agent.SYSTEM.format(max_steps=7)
+               + (note if memory_at == "system" else "")},
+              {"role": "user", "content": PROMPT + (note if memory_at == "request" else "")}]
+    assert all(call["messages"][:2] == pinned for call in fake.calls)
+    assert result["events"][0] == {"type": "user", "text": PROMPT}
+    assert json.loads(log.read_text(encoding="utf-8").splitlines()[0]) == result["events"][0]
+
+
+@pytest.mark.parametrize("memory_at", ["", "user", None, []])
+def test_invalid_memory_placement(ws, memory_at):
+    with pytest.raises(ValueError, match="memory_at"):
+        run(ws, [FINISH], memory_at=memory_at)
+
+
 def test_seed_differs_per_step(ws):
     _, fake = run(ws, [reply(("list_files", {}))] * 2 + [FINISH], seed=1000)
     assert [c["seed"] for c in fake.calls] == [1001, 1002, 1003]

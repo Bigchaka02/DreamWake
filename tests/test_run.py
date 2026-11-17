@@ -60,6 +60,7 @@ def test_perfect_agent_gives_a_valid_wake_and_passes_every_design(tmp_path, monk
     run.run_experiment(TASK, ["workspace", "handoff"], 1, 4096, 700, out, chat)
     workspace, handoff = rows(out)
     for row in (workspace, handoff):
+        assert row["repeat"] == 0
         assert row["valid"] and row["passed"], row
         assert row["task"] == TASK and row["seed"] == 0 and row["model"] == "fake-model"
         assert row["window"] == 4096 and row["reserve"] == 700 and row["wake_attempts"] == 1
@@ -84,6 +85,7 @@ def test_perfect_agent_gives_a_valid_wake_and_passes_every_design(tmp_path, monk
         assert (seed_dir / name).read_text(encoding="utf-8").strip(), name
     config = json.loads((out / "config.json").read_text(encoding="utf-8"))
     assert config["args"]["designs"] == ["workspace", "handoff"] and config["model"] == "fake-model"
+    assert config["args"]["final_repeats"] == 1
     assert config["git_commit"] and config["started"] and isinstance(config["git_dirty"], bool)
     assert len(chat.sleep_seeds) == 2 and None not in chat.sleep_seeds and len(set(chat.sleep_seeds)) == 2
     assert not set(chat.sleep_seeds) & set(chat.seeds)  # sleep seeds do not collide with any session step seed
@@ -105,6 +107,44 @@ def test_consolidated_design_runs_end_to_end_and_injects_its_rules_and_lessons(t
     sleep_calls = len(chat.sleep_seeds) - handoff["sleep_cost"]["calls"]
     assert sleep_calls >= 4 and consolidated["sleep_cost"]["calls"] == sleep_calls  # >= 1 extract + 1 merge each
     assert consolidated["sleep_cost"]["prompt_tokens"] == 80 * sleep_calls
+
+
+def test_nearby_final(tmp_path):
+    out = tmp_path / "out"
+    rule = "Store durations in milliseconds with the _MS suffix."
+    inner = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")},
+                           json.dumps({"kind": "rule", "text": rule}))
+    starts = []
+
+    def chat(messages, tools=None, **kwargs):
+        if tools is not None:
+            if len(messages) == 2:
+                starts.append(messages[:2])
+            prompt = next(p for p in SESSIONS if messages[1]["content"].startswith(p))
+            messages = [messages[0], {"role": "user", "content": prompt}, *messages[2:]]
+        return inner(messages, tools, **kwargs)
+
+    run.run_experiment(TASK, ["consolidated", "nearby"], 1, 4096, 700, out, chat, final_repeats=2)
+    result = rows(out)
+    assert len(result) == 4 and all(r["valid"] and r["passed"] for r in result)
+    assert [r["memory"] for r in result] == [f"- RULE: {rule}"] * 4
+    assert len({r["memory_tokens"] for r in result}) == 1
+    assert result[0]["sleep_cost"] == result[2]["sleep_cost"]
+    prompts = {sid: p for p, sid in SESSIONS.items()}
+    note = agent.MEMORY.format(memory=result[0]["memory"])
+    sessions = tasks.load_task(TASK)["sessions"]
+    assert starts[:2] == [[{"role": "system", "content": agent.SYSTEM.format(max_steps=s["max_steps"])},
+                          {"role": "user", "content": s["prompt"]}] for s in sessions[:2]]
+    system = agent.SYSTEM.format(max_steps=sessions[2]["max_steps"])
+    assert starts[2:4] == [[{"role": "system", "content": system + note},
+                           {"role": "user", "content": prompts["final"]}]] * 2
+    assert starts[4:] == [[{"role": "system", "content": system},
+                          {"role": "user", "content": prompts["final"] + note}]] * 2
+    for design in ("consolidated", "nearby"):
+        for suffix in ("", ".r1"):
+            log = out / "seed0" / f"final_{design}{suffix}.jsonl"
+            assert json.loads(log.read_text(encoding="utf-8").splitlines()[0]) == {
+                "type": "user", "text": prompts["final"]}
 
 
 def tree(root):
@@ -199,10 +239,11 @@ def test_invalid_wake_is_redone_then_the_seed_is_marked_invalid(tmp_path):
     out = tmp_path / "out"
     give_up = [("finish", {"summary": "nothing"})]
     chat = scripted_agent({"s1": give_up, "s2": give_up, "final": give_up})
-    run.run_experiment(TASK, ["workspace", "handoff"], 1, 4096, 700, out, chat, wake_retries=1)
+    run.run_experiment(TASK, ["workspace", "handoff"], 1, 4096, 700, out, chat, wake_retries=1, final_repeats=3)
     result = rows(out)
     assert [r["design"] for r in result] == ["workspace", "handoff"]
     assert all(not r["valid"] and r["wake_attempts"] == 2 for r in result)
+    assert all("repeat" not in r for r in result)
     assert result[0]["wake"] == {"s1_passed": False, "s2_passed": False, "trap_experienced": False}
     assert len(chat.seeds) == 4 and len(set(chat.seeds)) == 4  # seeds differ per attempt and session
     assert (out / "seed0" / "wake_s1.jsonl").exists() and (out / "seed0" / "wake_s1.attempt2.jsonl").exists()
@@ -248,6 +289,19 @@ def test_summarize_counts_rates_and_means(tmp_path):
     assert "| mean final seconds | 10.0 | 10.0 |" in table
     assert "| mean sleep seconds | 3.0 | 3.0 |" in table and "| mean injected tokens | 40.0 | 40.0 |" in table
     assert "workspace eval errors: 0" in table and "errored seeds: 0" in table
+    assert table.splitlines()[-1] == "final repeats: 1"
+
+
+def test_summary_repeats(tmp_path):
+    write_results(tmp_path, [summary_row(d, passed=r == 0, repeat=r, steps=2 + 4 * r)
+                             for d in ("workspace", "handoff") for r in range(3)]
+                  + [summary_row(d, seed=1, valid=False) for d in ("workspace", "handoff")])
+    table = run.summarize(tmp_path)
+    assert "| n valid | 1/2 | 1/2 |" in table
+    assert "| completion rate | 0.33 | 0.33 |" in table
+    assert "| mean steps | 6.0 | 6.0 |" in table
+    assert "| wake validity | 0.75 | 0.75 |" in table  # metrics still average rows
+    assert table.splitlines()[-1] == "final repeats: 3"
 
 
 def test_summarize_uses_only_seeds_that_have_a_row_for_every_design(tmp_path):
@@ -269,12 +323,32 @@ def test_summarize_leaves_evaluator_errors_out_of_every_rate_and_counts_them(tmp
 def test_cli_defaults(monkeypatch):
     seen = {}
     monkeypatch.setenv("DW_MODEL", "fake-model")
-    monkeypatch.setattr(run, "run_experiment", lambda *args: seen.update(args=args))
+    monkeypatch.setattr(run, "run_experiment", lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs))
     monkeypatch.setattr(run, "summarize", lambda out: "table")
     run.main(["--out", "somewhere"])
     task, designs_, seeds, window, reserve, out, chat = seen["args"]
     assert (task, designs_, seeds, window, reserve, str(out)) == (
         "settings_gen", ["workspace", "handoff"], 3, 4096, 1024, "somewhere")
+    assert seen["kwargs"] == {"final_repeats": 1}
+
+
+@pytest.mark.parametrize("count", [0, -1, 10])
+def test_cli_rejects_repeats(monkeypatch, capsys, count):
+    monkeypatch.setenv("DW_MODEL", "fake-model")
+    with pytest.raises(SystemExit) as caught:
+        run.main(["--final-repeats", str(count)])
+    assert caught.value.code == 2
+    assert "final-repeats must be between 1 and 9" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("count", [1, 9])
+def test_cli_forwards_repeats(monkeypatch, count):
+    seen = {}
+    monkeypatch.setenv("DW_MODEL", "fake-model")
+    monkeypatch.setattr(run, "run_experiment", lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(run, "summarize", lambda out: "table")
+    run.main(["--final-repeats", str(count), "--out", "somewhere"])
+    assert seen == {"final_repeats": count}
 
 
 def test_cli_summarize_prints_the_table(tmp_path, capsys):
@@ -302,6 +376,44 @@ def test_every_designs_final_session_runs_in_the_same_directory_and_is_archived_
     assert not (seed_dir / "ws_final").exists()
     for design in ("workspace", "handoff"):
         assert (seed_dir / f"final_{design}_ws" / "src" / "retry.py").exists()
+
+
+def test_final_repeats(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    real, starts = agent.run_session, []
+
+    def spy(task_id, workspace, prompt, **kwargs):
+        if SESSIONS[prompt] == "final":
+            starts.append((Path(workspace), kwargs["seed"], tree(workspace)))
+        return real(task_id, workspace, prompt, **kwargs)
+
+    monkeypatch.setattr(run.agent, "run_session", spy)
+    trap = [w for w in writes("trap") if w[1]["path"] == "src/settings.py"]
+    chat = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"),
+                           "final": trap + [("write_file", {"path": "repeat.txt", "content": "changed"}),
+                                            ("finish", {"summary": "done"})]})
+    run.run_experiment(TASK, ["workspace", "handoff"], 2, 4096, 700, out, chat, final_repeats=3)
+    result = rows(out)
+    assert [(r["seed"], r["design"], r["repeat"]) for r in result] == [
+        (k, d, r) for k in range(2) for d in ("workspace", "handoff") for r in range(3)]
+    assert len(starts) == 12 and len(chat.sleep_seeds) == 4  # two sleeps per seed, only for handoff
+    assert json.loads((out / "config.json").read_text(encoding="utf-8"))["args"]["final_repeats"] == 3
+    for row, (workspace, seed, before) in zip(result, starts):
+        k, design, r = row["seed"], row["design"], row["repeat"]
+        seed_dir = out / f"seed{k}"
+        assert workspace == seed_dir / "ws_final"
+        assert seed == k * run.SEED_STRIDE + run.FINAL_OFFSET + r * run.SESSION_STRIDE
+        assert before == tree(seed_dir / "ws_wake") and "repeat.txt" not in before
+        suffix = f".r{r}" if r else ""
+        log = seed_dir / f"final_{design}{suffix}.jsonl"
+        assert log.read_text(encoding="utf-8").strip()
+        archive = seed_dir / f"final_{design}_ws{suffix}"
+        assert (archive / "repeat.txt").read_text(encoding="utf-8") == "changed"
+        assert row["repeated_mistake"] and not row["passed"] and not row["checks"]["test_trap_avoided"]
+        first = next(x for x in result if x["seed"] == k and x["design"] == design)
+        for key in ("sleep_cost", "memory_chars", "memory_tokens", "memory", "practice_log", "contamination"):
+            assert row[key] == first[key]
+        assert not workspace.exists()
 
 
 def write_event(step, path, result="wrote 3 characters to x"):
@@ -354,8 +466,9 @@ def test_a_seed_that_dies_midway_leaves_no_rows_and_earlier_seeds_stay(tmp_path)
         return inner(messages, tools, **kwargs)
     out = tmp_path / "out"
     with pytest.raises(ValueError):
-        run.run_experiment(TASK, ["workspace", "handoff"], 2, 4096, 700, out, chat)
-    assert [(r["seed"], r["design"]) for r in rows(out)] == [(0, "workspace"), (0, "handoff")]
+        run.run_experiment(TASK, ["workspace", "handoff"], 2, 4096, 700, out, chat, final_repeats=2)
+    assert [(r["seed"], r["design"], r["repeat"]) for r in rows(out)] == [
+        (0, d, r) for d in ("workspace", "handoff") for r in range(2)]
 
 
 def test_an_existing_results_file_is_never_appended_to(tmp_path):

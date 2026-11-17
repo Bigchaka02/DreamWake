@@ -8,6 +8,8 @@ from . import agent, tasks
 from .agent import render_chunks, render_events
 from .llm import CHARS_PER_TOKEN, estimate_tokens
 
+AT_REQUEST = {"nearby"}
+
 HANDOFF_INSTRUCTION = (
     "Your conversation memory is about to be erased. Write a handoff note to yourself, at most 120 words; it is the "
     "only thing you will remember next time. Cover: 1) the goal and the current state; 2) decisions and project "
@@ -284,7 +286,7 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
         reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve, seed=seed)
         cost = {"calls": 1, **reply["usage"], "seconds": reply["seconds"]}
         return (reply["content"] or "").strip()[:NOTE_CAP], cost
-    if design == "consolidated":
+    if design in ("consolidated", "nearby"):
         return _consolidate(artifact, events, chat, window, reserve, seed)
     if design in ("dreaming", "replay"):
         artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
@@ -299,7 +301,7 @@ def inject(design, artifact):
         return ""
     if design == "handoff":
         return artifact or ""
-    if design in ("consolidated", "dreaming", "replay"):  # practice requests are never injected
+    if design in ("consolidated", "nearby", "dreaming", "replay"):  # practice requests are never injected
         items = artifact["items"] if artifact else []
         return "\n".join(f"- {item['kind'].upper()}: {item['text']}" for item in items)
     raise ValueError(f"unknown design: {design!r}")

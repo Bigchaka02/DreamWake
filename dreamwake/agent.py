@@ -83,11 +83,15 @@ def _execute(task_id, workspace, name, args, known):
         return f"error: {error}"
 
 
-def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat, memory="", seed=None,
-                log_path=None):
+def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat, memory="", memory_at="system",
+                seed=None, log_path=None):
+    if memory_at not in ("system", "request"):
+        raise ValueError("memory_at must be 'system' or 'request'")
     workspace = Path(workspace).resolve()
-    system = SYSTEM.format(max_steps=max_steps) + (MEMORY.format(memory=memory) if memory else "")
-    pinned = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    note = MEMORY.format(memory=memory) if memory else ""
+    system = SYSTEM.format(max_steps=max_steps) + (note if memory_at == "system" else "")
+    request = prompt + (note if memory_at == "request" else "")
+    pinned = [{"role": "system", "content": system}, {"role": "user", "content": request}]
     units, dropped = [], 0  # a unit = an assistant message plus the message(s) answering it
     events = [{"type": "user", "text": prompt}]
     log = list(events)

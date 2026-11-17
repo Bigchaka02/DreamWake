@@ -208,6 +208,29 @@ def test_consolidated_inject_formats_rules_and_lessons_in_order():
     assert designs.inject("consolidated", None) == "" and designs.inject("consolidated", {"items": []}) == ""
 
 
+def test_nearby_sleep():
+    artifacts = {"consolidated": None, "nearby": None}
+    for item in (SECONDS, MILLIS):
+        outputs = []
+        for design in artifacts:
+            fake = memory_chat(lines(item, LESSON), lines(item, LESSON))
+            artifact, cost = designs.sleep(design, artifacts[design], session_events(2), chat=fake,
+                                           window=4096, reserve=700, seed=42)
+            artifacts[design] = artifact
+            outputs.append((artifact, cost, fake.calls))
+        assert outputs[0] == outputs[1]
+    assert artifacts["nearby"] == {"items": [{"kind": "rule", "text": MILLIS[1]},
+                                            {"kind": "lesson", "text": LESSON[1]}]}
+
+
+@pytest.mark.parametrize("artifact", [None, {"items": []},
+                                    {"items": [{"kind": "rule", "text": MILLIS[1]},
+                                               {"kind": "lesson", "text": LESSON[1]}]}])
+def test_nearby_inject(artifact):
+    assert designs.inject("nearby", artifact) == designs.inject("consolidated", artifact)
+    assert designs.AT_REQUEST == {"nearby"}
+
+
 def test_consolidated_cost_sums_every_call():
     fake = memory_chat(lines(MILLIS), lines(MILLIS))
     _, cost = designs.sleep("consolidated", None, session_events(30), chat=fake, window=1000, reserve=300)

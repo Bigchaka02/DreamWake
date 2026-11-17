@@ -53,9 +53,10 @@ def _wrote_trap(events, trap_paths, workspace):
     return False
 
 
-def _session(task_id, session, workspace, chat, window, reserve, seed, log_path, memory=""):
+def _session(task_id, session, workspace, chat, window, reserve, seed, log_path, memory="", *, memory_at="system"):
     return agent.run_session(task_id, workspace, session["prompt"], max_steps=session["max_steps"], window=window,
-                             reserve=reserve, chat=chat, memory=memory, seed=seed, log_path=log_path)
+                             reserve=reserve, chat=chat, memory=memory, memory_at=memory_at,
+                             seed=seed, log_path=log_path)
 
 
 def _snapshot(workspace, dest):
@@ -87,7 +88,8 @@ def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
     return None, wake
 
 
-def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window, reserve, trap_paths):
+def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window, reserve, trap_paths,
+           final_repeats=1):
     artifact, sleep_cost = None, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     practice_log = []
     for i, (sid, events) in enumerate(zip(("s1", "s2"), wake["events"])):
@@ -100,27 +102,33 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
         practice_log += artifact.get("practice", []) if isinstance(artifact, dict) else []
     memory = designs.inject(design, artifact)
     workspace = seed_dir / "ws_final"  # the same path for every design: the path must not name the design
-    shutil.rmtree(workspace, ignore_errors=True)
-    tasks._copy(wake_ws, workspace)
-    result = _session(task_id, sessions["final"], workspace, chat, window, reserve, k * SEED_STRIDE + FINAL_OFFSET,
-                      seed_dir / f"final_{design}.jsonl", memory)
-    evaluation = tasks.evaluate(task_id, "final", workspace, baseline_dir=baseline)
-    repeated = _wrote_trap(result["events"], trap_paths, workspace)
-    archive = seed_dir / f"final_{design}_ws"
-    shutil.rmtree(archive, ignore_errors=True)
-    shutil.move(workspace, archive)
-    return {"checks": evaluation["checks"], "passed": evaluation["passed"], "eval_error": evaluation.get("error"),
-            "steps": result["steps"], "ended_by": result["ended_by"], "ran_out_of_steps": result["ran_out_of_steps"],
-            "overflow": result["overflow"], "repeated_mistake": repeated,
-            "prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
-            "max_prompt_tokens": result["max_prompt_tokens"], "seconds": result["seconds"],
-            "sleep_cost": sleep_cost, "memory_chars": len(memory),
-            "memory_tokens": llm.estimate_tokens(agent.MEMORY.format(memory=memory)) if memory else 0,
-            "memory": memory, "practice_log": practice_log,
-            "contamination": designs.contamination(memory, practice_log, wake["events"])}
+    rows = []
+    for r in range(final_repeats):
+        shutil.rmtree(workspace, ignore_errors=True)
+        tasks._copy(wake_ws, workspace)
+        suffix = f".r{r}" if r else ""
+        seed = k * SEED_STRIDE + FINAL_OFFSET + r * SESSION_STRIDE
+        result = _session(task_id, sessions["final"], workspace, chat, window, reserve, seed,
+                          seed_dir / f"final_{design}{suffix}.jsonl", memory,
+                          memory_at="request" if design in designs.AT_REQUEST else "system")
+        evaluation = tasks.evaluate(task_id, "final", workspace, baseline_dir=baseline)
+        repeated = _wrote_trap(result["events"], trap_paths, workspace)
+        archive = seed_dir / f"final_{design}_ws{suffix}"
+        shutil.rmtree(archive, ignore_errors=True)
+        shutil.move(workspace, archive)
+        rows.append({"repeat": r, "checks": evaluation["checks"], "passed": evaluation["passed"],
+                     "eval_error": evaluation.get("error"), "steps": result["steps"], "ended_by": result["ended_by"],
+                     "ran_out_of_steps": result["ran_out_of_steps"], "overflow": result["overflow"],
+                     "repeated_mistake": repeated, "prompt_tokens": result["prompt_tokens"],
+                     "completion_tokens": result["completion_tokens"], "max_prompt_tokens": result["max_prompt_tokens"],
+                     "seconds": result["seconds"], "sleep_cost": sleep_cost, "memory_chars": len(memory),
+                     "memory_tokens": llm.estimate_tokens(agent.MEMORY.format(memory=memory)) if memory else 0,
+                     "memory": memory, "practice_log": practice_log,
+                     "contamination": designs.contamination(memory, practice_log, wake["events"])})
+    return rows
 
 
-def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3):
+def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3, final_repeats=1):
     for design in designs_:
         designs.inject(design, None)  # fail fast on an unknown design name, before any LLM call
     task = tasks.load_task(task_id)
@@ -132,7 +140,8 @@ def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wak
     out.mkdir(parents=True, exist_ok=True)
     model = os.environ.get("DW_MODEL")
     config = {"args": {"task": task_id, "designs": list(designs_), "seeds": seeds, "window": window,
-                       "reserve": reserve, "out": str(out), "wake_retries": wake_retries},
+                       "reserve": reserve, "out": str(out), "wake_retries": wake_retries,
+                       "final_repeats": final_repeats},
               "model": model, "git_commit": _git_commit(), "git_dirty": _git_dirty(),
               "started": datetime.now(timezone.utc).isoformat()}
     (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -153,9 +162,11 @@ def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wak
                 row = {"task": task_id, "seed": k, "design": design, "model": model, "window": window,
                        "reserve": reserve, "wake_attempts": wake["attempts"], "wake": flags, "valid": bool(wake_ws)}
                 if wake_ws:
-                    row.update(_final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window,
-                                      reserve, trap_paths))
-                rows.append(row)
+                    rows.extend({**row, **final} for final in _final(
+                        task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window,
+                        reserve, trap_paths, final_repeats))
+                else:
+                    rows.append(row)
         except (RuntimeError, OSError) as error:  # a transport or evaluator fault loses this seed, not the run
             with open(out / "errors.jsonl", "a", encoding="utf-8") as errors:
                 errors.write(json.dumps({"seed": k, "error": f"{type(error).__name__}: {error}"}) + "\n")
@@ -198,13 +209,15 @@ def summarize(out_dir):
                  ("mean wake attempts", lambda r: r["wake_attempts"], "{:.1f}"),
                  ("trap-experienced rate", lambda r: r["wake"]["trap_experienced"], rate)]
     table = ["| metric | " + " | ".join(names) + " |", "|---|" + "---|" * len(names),
-             "| n valid | " + " | ".join(f"{len(valid[d])}/{len(by_design[d])}" for d in names) + " |"]
+             "| n valid | " + " | ".join(f"{len({r['seed'] for r in valid[d]})}/"
+                                         f"{len({r['seed'] for r in by_design[d]})}" for d in names) + " |"]
     for label, value, fmt in wake_rows:
         table.append(f"| {label} | " + " | ".join(_mean(map(value, by_design[d]), fmt) for d in names) + " |")
     for label, value, fmt in metrics:
         table.append(f"| {label} | " + " | ".join(_mean(map(value, final[d]), fmt) for d in names) + " |")
     table += [f"{d} eval errors: {sum(1 for r in valid[d] if r.get('eval_error'))}" for d in names]
-    return "\n".join(table + [f"errored seeds: {errored}"])
+    repeats = max((r.get("repeat", 0) for r in rows), default=0) + 1
+    return "\n".join(table + [f"errored seeds: {errored}", f"final repeats: {repeats}"])
 
 
 def main(argv=None):
@@ -212,11 +225,14 @@ def main(argv=None):
     parser.add_argument("--task", default="settings_gen")
     parser.add_argument("--designs", default="workspace,handoff")
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--final-repeats", type=int, default=1)
     parser.add_argument("--window", type=int, default=4096)
     parser.add_argument("--reserve", type=int, default=1024)
     parser.add_argument("--out", help="output directory (default runs/<UTC timestamp>)")
     parser.add_argument("--summarize", metavar="DIR", help="print the summary of an existing run and exit")
     args = parser.parse_args(argv)
+    if not 1 <= args.final_repeats <= 9:
+        parser.error("final-repeats must be between 1 and 9")
     if args.summarize:
         print(summarize(args.summarize))
         return
@@ -225,7 +241,8 @@ def main(argv=None):
     if not 0 < args.reserve < args.window or args.seeds < 1:
         parser.error("need 0 < reserve < window and seeds >= 1")
     out = args.out or Path("runs") / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_experiment(args.task, args.designs.split(","), args.seeds, args.window, args.reserve, out, llm.chat)
+    run_experiment(args.task, args.designs.split(","), args.seeds, args.window, args.reserve, out, llm.chat,
+                   final_repeats=args.final_repeats)
     print(summarize(out))
 
 
