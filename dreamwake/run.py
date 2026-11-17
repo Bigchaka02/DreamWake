@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 SEED_STRIDE, ATTEMPT_STRIDE, SESSION_STRIDE = 100_000, 1_000, 100  # chat seed = sum of these + step
 FINAL_OFFSET = 99_000  # same final-session seeds for every design (common random numbers)
 SLEEP_OFFSET = 98_000  # likewise for the sleep calls; stays clear of the wake and final seeds
+PRACTICE_STEPS = 12  # step cap of one practice session during the dreaming / replay sleep
 
 
 def _git(*args):
@@ -57,6 +58,11 @@ def _session(task_id, session, workspace, chat, window, reserve, seed, log_path,
                              reserve=reserve, chat=chat, memory=memory, seed=seed, log_path=log_path)
 
 
+def _snapshot(workspace, dest):
+    shutil.rmtree(dest, ignore_errors=True)
+    tasks._copy(workspace, dest)
+
+
 def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
     """Run s1 then s2 on one workspace until s2's hidden tests pass. Returns (workspace or None, wake)."""
     for attempt in range(1, wake_retries + 2):
@@ -67,8 +73,10 @@ def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
         wake = {"attempts": attempt, "events": []}
         for i, sid in enumerate(("s1", "s2")):
             seed = k * SEED_STRIDE + attempt * ATTEMPT_STRIDE + i * SESSION_STRIDE
+            _snapshot(workspace, seed_dir / f"snap_{sid}_before")
             result = _session(task_id, sessions[sid], workspace, chat, window, reserve, seed,
                               seed_dir / f"wake_{sid}{suffix}.jsonl")
+            _snapshot(workspace, seed_dir / f"snap_{sid}_after")
             evaluation = tasks.evaluate(task_id, sid, workspace)
             if evaluation.get("error"):  # the evaluator broke; that says nothing about the agent
                 raise RuntimeError(evaluation["error"])
@@ -81,10 +89,15 @@ def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
 
 def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window, reserve, trap_paths):
     artifact, sleep_cost = None, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
-    for i, events in enumerate(wake["events"]):
+    practice_log = []
+    for i, (sid, events) in enumerate(zip(("s1", "s2"), wake["events"])):
+        practice = {"task_id": task_id, "request": sessions[sid]["prompt"],
+                    "ws_before": seed_dir / f"snap_{sid}_before", "ws_after": seed_dir / f"snap_{sid}_after",
+                    "scratch": seed_dir / f"practice_{design}_{sid}", "max_steps": PRACTICE_STEPS}
         artifact, cost = designs.sleep(design, artifact, events, chat=chat, window=window, reserve=reserve,
-                                       seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SESSION_STRIDE)
-        sleep_cost = {key: sleep_cost[key] + cost[key] for key in sleep_cost}
+                                       seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SESSION_STRIDE, practice=practice)
+        sleep_cost = {key: sleep_cost.get(key, 0) + value for key, value in cost.items()}
+        practice_log += artifact.get("practice", []) if isinstance(artifact, dict) else []
     memory = designs.inject(design, artifact)
     workspace = seed_dir / "ws_final"  # the same path for every design: the path must not name the design
     shutil.rmtree(workspace, ignore_errors=True)
@@ -103,7 +116,8 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
             "max_prompt_tokens": result["max_prompt_tokens"], "seconds": result["seconds"],
             "sleep_cost": sleep_cost, "memory_chars": len(memory),
             "memory_tokens": llm.estimate_tokens(agent.MEMORY.format(memory=memory)) if memory else 0,
-            "memory": memory}
+            "memory": memory, "practice_log": practice_log,
+            "contamination": designs.contamination(memory, practice_log, wake["events"])}
 
 
 def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3):

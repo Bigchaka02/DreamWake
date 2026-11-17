@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from dreamwake import agent, llm, run, tasks
+from dreamwake import agent, designs, llm, run, tasks
 
 TASK = "settings_gen"
 SESSIONS = {s["prompt"]: s["id"] for s in tasks.load_task(TASK)["sessions"]}
@@ -105,6 +105,67 @@ def test_consolidated_design_runs_end_to_end_and_injects_its_rules_and_lessons(t
     sleep_calls = len(chat.sleep_seeds) - handoff["sleep_cost"]["calls"]
     assert sleep_calls >= 4 and consolidated["sleep_cost"]["calls"] == sleep_calls  # >= 1 extract + 1 merge each
     assert consolidated["sleep_cost"]["prompt_tokens"] == 80 * sleep_calls
+
+
+def tree(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in Path(root).rglob("*") if p.is_file()}
+
+
+def test_dreaming_and_replay_practise_on_snapshots_of_the_wake_and_log_it(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    memory = '{"kind": "rule", "text": "Store durations in milliseconds with the _MS suffix."}'
+    dreams = ["Add `CACHE_TTL_SECONDS` of 5 seconds.", "Add a poll interval of 9 seconds."]
+    inner = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")}, memory)
+    practised = []
+    real = agent.run_session
+
+    def spy(task_id, workspace, prompt, **kwargs):
+        if Path(workspace).parent.name.startswith("practice_"):
+            practised.append((Path(workspace).parent.name, prompt))
+        return real(task_id, workspace, prompt, **kwargs)
+    monkeypatch.setattr(run.agent, "run_session", spy)
+
+    def chat(messages, tools=None, **kwargs):
+        prompt = messages[-1]["content"] if tools is None else messages[1]["content"]
+        if tools is None and prompt.endswith(designs.DREAM_INSTRUCTION):
+            content = "\n".join(json.dumps({"request": d}) for d in dreams)
+        elif tools is None and prompt.endswith(designs.REVIEW_INSTRUCTION):
+            content = "NONE"
+        elif tools is not None and prompt in dreams:
+            return {"content": "", "tool_calls": [{"name": "finish", "arguments": {"summary": "ok"}, "raw": "{}"}],
+                    "usage": {"prompt_tokens": 500, "completion_tokens": 50}, "seconds": 1.0,
+                    "finish_reason": "tool_calls"}
+        else:
+            return inner(messages, tools, **kwargs)
+        return {"content": content, "tool_calls": [], "usage": {"prompt_tokens": 80, "completion_tokens": 30},
+                "seconds": 2.0, "finish_reason": "stop"}
+    run.run_experiment(TASK, ["workspace", "handoff", "consolidated", "dreaming", "replay"], 1, 4096, 700, out, chat)
+    result = {r["design"]: r for r in rows(out)}
+    assert list(result) == ["workspace", "handoff", "consolidated", "dreaming", "replay"]
+    assert all(r["valid"] and r["passed"] for r in result.values())
+    prompts = {sid: s["prompt"] for s in tasks.load_task(TASK)["sessions"] for sid in [s["id"]]}
+    for design in ("workspace", "handoff", "consolidated"):
+        assert result[design]["practice_log"] == [] and result[design]["contamination"] == []
+    replay, dreaming = result["replay"]["practice_log"], result["dreaming"]["practice_log"]
+    assert [e["request"] for e in replay] == [prompts["s1"]] * 2 + [prompts["s2"]] * 2
+    assert [e["request"] for e in dreaming] == dreams * 2 and all(e["hypothetical"] for e in dreaming)
+    assert all(set(e) == {"request", "hypothetical", "score", "problems", "refined", "score2", "accepted"}
+               for e in replay + dreaming)
+    assert [e["score"] for e in replay + dreaming] == [0] * 8  # the scripted agent passes its real sessions
+    for design in ("dreaming", "replay"):
+        assert result[design]["memory"] == result["consolidated"]["memory"]
+        assert result[design]["sleep_cost"]["practice_sessions"] == 4
+        assert result[design]["sleep_cost"]["calls"] == result["consolidated"]["sleep_cost"]["calls"] + 4 + (
+            2 if design == "dreaming" else 0)
+        assert result[design]["contamination"] == []
+    assert [name for name, _ in practised] == (["practice_dreaming_s1"] * 2 + ["practice_dreaming_s2"] * 2
+                                               + ["practice_replay_s1"] * 2 + ["practice_replay_s2"] * 2)
+    seed_dir = out / "seed0"
+    fresh = tasks.make_workspace(TASK, tmp_path / "fresh")
+    assert tree(seed_dir / "snap_s1_before") == tree(fresh)
+    assert tree(seed_dir / "snap_s1_after") == tree(seed_dir / "snap_s2_before") != tree(fresh)
+    assert tree(seed_dir / "snap_s2_after") == tree(seed_dir / "ws_wake") == tree(seed_dir / "baseline")
+    assert (seed_dir / "practice_replay_s1" / "attempt0" / "CHANGES.md").exists()
 
 
 def test_editing_the_generated_file_in_the_final_session_fails_and_counts_as_repeated(tmp_path):
