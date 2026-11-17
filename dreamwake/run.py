@@ -16,7 +16,7 @@ from . import agent, designs, llm, tasks
 REPO = Path(__file__).resolve().parent.parent
 SEED_STRIDE, ATTEMPT_STRIDE, SESSION_STRIDE = 100_000, 1_000, 100  # chat seed = sum of these + step
 FINAL_OFFSET = 99_000  # same final-session seeds for every design (common random numbers)
-SLEEP_OFFSET = 98_000  # likewise for the sleep calls; stays clear of the wake and final seeds
+SLEEP_OFFSET, SLEEP_STRIDE = 50_000, 1_000  # room for each sleep's calls; all nine stay below FINAL_OFFSET
 PRACTICE_STEPS = 20  # step cap of one practice session during the dreaming / replay sleep (same as a real session)
 
 
@@ -26,7 +26,7 @@ def parse_design(spec):
     if plus and suffix != "gate":
         raise ValueError(f"unknown design suffix: {suffix!r}; expected '+gate'")
     store, at, placement = base.partition("@")
-    if store not in ("workspace", "handoff", "consolidated", "replay", "dreaming", "oracle", "requests"):
+    if store not in ("workspace", "handoff", "consolidated", "replay", "dreaming", "oracle", "requests", "review"):
         raise ValueError(f"unknown store: {store!r}")
     if at and placement not in ("system", "request", "tail"):
         raise ValueError(f"unknown placement: {placement!r}")
@@ -114,18 +114,21 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
     label = design.replace("@", "_at_").replace("+", "_")
     artifact, sleep_cost = None, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     practice_log = []
+    review_log = []
     memory = oracle_memory
     if store != "oracle":
         for i, (session, events) in enumerate(zip(sessions[:-1], wake["events"])):
             sid = session["id"]
             practice = {"task_id": task_id, "request": session["prompt"],
+                        "requests": [s["prompt"] for s in sessions[:i + 1]],
                         "ws_before": seed_dir / f"snap_{sid}_before", "ws_after": seed_dir / f"snap_{sid}_after",
                         "scratch": seed_dir / f"practice_{label}_{sid}", "max_steps": PRACTICE_STEPS,
                         "memory_at": placement, "finish_gate": gate}
             artifact, cost = designs.sleep(store, artifact, events, chat=chat, window=window, reserve=reserve,
-                                           seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SESSION_STRIDE, practice=practice)
+                                           seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SLEEP_STRIDE, practice=practice)
             sleep_cost = {key: sleep_cost.get(key, 0) + value for key, value in cost.items()}
             practice_log += artifact.get("practice", []) if isinstance(artifact, dict) else []
+            review_log += artifact.get("review", []) if isinstance(artifact, dict) else []
         memory = designs.inject(store, artifact)
     workspace = seed_dir / "ws_final"  # the same path for every design: the path must not name the design
     rows = []
@@ -150,7 +153,7 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
                      "completion_tokens": result["completion_tokens"], "max_prompt_tokens": result["max_prompt_tokens"],
                      "seconds": result["seconds"], "sleep_cost": sleep_cost, "memory_chars": len(memory),
                      "memory_tokens": llm.estimate_tokens(agent.MEMORY.format(memory=memory)) if memory else 0,
-                     "memory": memory, "practice_log": practice_log,
+                     "memory": memory, "practice_log": practice_log, "review_log": review_log,
                      "contamination": designs.contamination(memory, practice_log, wake["events"])})
     return rows
 

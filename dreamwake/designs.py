@@ -50,6 +50,14 @@ REFINE_INSTRUCTION = (
     "one short example. Never reverse or weaken a rule. Keep every other rule as it is. Do not record the practice "
     "request or its feature as a fact: it was hypothetical. Output the complete list as JSON lines, one object per "
     "line: {\"kind\": \"rule\" or \"lesson\", \"text\": \"...\"}")
+REVIEW_INSTRUCTION = (
+    "Above are the user's requests on this project, word for word, oldest first, and the RULES the agent will "
+    "carry into its next session. Check that every standing decision of the user (a naming, format, unit or "
+    "process policy meant for all future work, not a one-off task) is stated in the rules as a general "
+    "instruction that keeps the user's exact terms. If one is missing, too narrow or out of date, fix it by "
+    "editing exactly ONE rule: give its number, or 0 to add a new rule, and the full new text of that rule (at "
+    "most 35 words). If the rules already cover every standing decision, answer with number -1 and an empty "
+    "text.")
 NOTE_CAP = 900  # characters of injected memory, for every design
 ITEM_CAP, TEXT_CAP = 8, 240
 REPLACES, REPLACES_CAP = "(replaces:", 60  # a longer or unterminated "(replaces: ...)" copies an old rule
@@ -85,8 +93,12 @@ def _clean(text):
     return text
 
 
+def _item_text(text):
+    return _clean(re.sub(r"^(?:RULE|LESSON)\s*:\s*", "", text.strip(), flags=re.IGNORECASE)[:TEXT_CAP])
+
+
 def parse_items(text):
-    items = [{"kind": value.get("kind", "rule"), "text": _clean(value["text"].strip()[:TEXT_CAP])}
+    items = [{"kind": value.get("kind", "rule"), "text": _item_text(value["text"])}
              for value in _objects(text, "text") if value.get("kind", "rule") in ("rule", "lesson")]
     return [item for item in items if item["text"]]
 
@@ -100,9 +112,16 @@ def _merge_prompt(current, candidates):
             + MERGE_INSTRUCTION)
 
 
-def _ask(chat, prompt, reserve, seed, cost):
+def _schema(name, properties, required):
+    """An OpenAI-style strict JSON-schema response format for one object."""
+    return {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": {
+        "type": "object", "properties": properties, "required": required}}}
+
+
+def _ask(chat, prompt, reserve, seed, cost, response_format=None):
     """One single-message chat call, added to cost. Returns the reply text."""
-    reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve, seed=seed)
+    options = {"response_format": response_format} if response_format is not None else {}
+    reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve, seed=seed, **options)
     cost["calls"] += 1
     cost["seconds"] += reply["seconds"]
     for key in ("prompt_tokens", "completion_tokens"):
@@ -116,6 +135,29 @@ def _capped(items):
     while len(inject("consolidated", {"items": items})) > NOTE_CAP:
         items = items[:-1]
     return items
+
+
+def _edit(items, number, text):
+    """items with exactly one rule changed: number 1..len(items) replaces that item's text (kind kept);
+    0 adds a new rule at the front. Returns (candidate, reason); candidate is None when the edit is refused."""
+    text = _item_text(text)
+    if not text:
+        return None, "empty text"
+    if type(number) is not int or not 0 <= number <= len(items):
+        return None, "bad number"
+    candidate = items[:]
+    index = number - 1 if number else 0
+    if number:
+        candidate[index] = {**items[index], "text": text}
+    else:
+        candidate.insert(0, {"kind": "rule", "text": text})
+    candidate = _capped(candidate)
+    if index >= len(candidate):
+        return None, "does not fit"
+    memory = inject("consolidated", {"items": candidate})
+    if number and any(name not in memory for name in _identifiers(items[index]["text"])):
+        return None, "edit drops identifiers"
+    return candidate, ""
 
 
 def _consolidate(artifact, events, chat, window, reserve, seed):
@@ -143,6 +185,11 @@ def _consolidate(artifact, events, chat, window, reserve, seed):
 
 def _numbered(items):
     return "\n".join(f"{i}. {item['kind'].upper()}: {item['text']}" for i, item in enumerate(items, 1)) or "(none)"
+
+
+def _archive(requests):
+    return "\n".join(f"{i}. {text}" for i, text in enumerate(
+        (text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ") for text in requests), 1))
 
 
 def _fit(build, budget, *texts):
@@ -200,7 +247,7 @@ def _practise(design, items, practice, chat, window, reserve, seed, cost):
     cost["practice_sessions"] = 0
     budget, used = window - reserve - FRAMING_TOKENS, [0]
 
-    def fresh(span=1):  # shortcut: offsets (at most 4 * max_steps + 6) stay under run.py's stride of 100 up to 23
+    def fresh(span=1):  # shortcut: offsets (at most 4 * max_steps + 6) fit run.py's stride of 1,000 up to 248
         used[0] += span
         return None if seed is None else seed + used[0] - span + 1
 
@@ -272,7 +319,8 @@ def contamination(memory, practice_log, wake_events):
 
 def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practice=None):
     """Turn one session's events into the design's artifact. Returns (artifact, cost).
-    practice: the session's task_id, request, workspace snapshots, scratch dir and max_steps (dreaming, replay)."""
+    practice: requests archive (review); task_id, request, workspace snapshots, scratch dir and max_steps
+    (dreaming, replay)."""
     cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     if design == "workspace":
         return None, cost
@@ -290,6 +338,28 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
         return (reply["content"] or "").strip()[:NOTE_CAP], cost
     if design == "consolidated":
         return _consolidate(artifact, events, chat, window, reserve, seed)
+    if design == "review":
+        artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
+        items = artifact["items"]
+        requests = practice.get("requests", []) if practice else []
+        if not requests:
+            return {"items": items, "review": []}, cost
+        prompt = _fit(lambda archive, rules: (f"USER REQUESTS:\n{archive}\n\nRULES:\n{rules}\n\n"
+                                              + REVIEW_INSTRUCTION),
+                      window - reserve - FRAMING_TOKENS, _archive(requests), _numbered(items))
+        reply = _loads(_ask(chat, prompt, reserve, None if seed is None else seed + 1, cost,
+                            _schema("edit", {"number": {"type": "integer"}, "text": {"type": "string"}},
+                                    ["number", "text"])))
+        record = {"number": None, "text": None, "applied": False, "reason": "invalid reply",
+                  "items_before": [item.copy() for item in items]}
+        if isinstance(reply, dict) and type(reply.get("number")) is int:
+            number, text = reply["number"], reply.get("text")
+            record.update(number=number, text=text, reason="")
+            if number != -1:
+                candidate, record["reason"] = _edit(items, number, text if isinstance(text, str) else "")
+                if candidate is not None:
+                    items, record["applied"] = candidate, True
+        return {"items": items, "review": [record]}, cost
     if design in ("dreaming", "replay"):
         artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
         items, record = _practise(design, artifact["items"], practice, chat, window, reserve, seed, cost)
@@ -318,7 +388,7 @@ def inject(design, artifact):
             kept.append(prefix + text)
             remaining -= len(prefix + text) + (1 if len(kept) > 1 else 0)
         return "\n".join(reversed(kept))
-    if design in ("consolidated", "dreaming", "replay"):  # practice requests are never injected
+    if design in ("consolidated", "dreaming", "replay", "review"):  # offline requests are never injected
         items = artifact["items"] if artifact else []
         return "\n".join(f"- {item['kind'].upper()}: {item['text']}" for item in items)
     raise ValueError(f"unknown design: {design!r}")

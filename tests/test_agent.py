@@ -92,7 +92,18 @@ def test_chat_defaults_to_the_ipv4_loopback_endpoint(monkeypatch):
     out = llm.chat([], max_tokens=10)
     assert sent["url"] == "http://127.0.0.1:1234/v1/chat/completions"
     assert "tools" not in sent["body"] and "seed" not in sent["body"]
+    assert "response_format" not in sent["body"]
     assert out["content"] == "hi" and out["tool_calls"] == [] and out["usage"]["prompt_tokens"] == 0
+
+
+def test_chat_posts_response_format_unchanged(monkeypatch):
+    monkeypatch.setenv("DW_MODEL", "tiny-model")
+    sent = fake_urlopen(monkeypatch, {"choices": [{"message": {"content": "{}"}}]})
+    response_format = {"type": "json_schema", "json_schema": {"name": "edit", "strict": True,
+                       "schema": {"type": "object", "properties": {"number": {"type": "integer"}},
+                                  "required": ["number"]}}}
+    llm.chat([], max_tokens=10, response_format=response_format)
+    assert sent["body"]["response_format"] == response_format
 
 
 def test_chat_without_dw_model_raises(monkeypatch):

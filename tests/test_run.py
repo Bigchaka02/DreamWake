@@ -13,7 +13,7 @@ REFERENCE = tasks.load_task(TASK)["reference"]
 NOTE = "Settings live in settings.tmpl.json; durations are in _MS (replaces seconds)."
 
 
-@pytest.mark.parametrize("store", ["handoff", "consolidated", "replay", "dreaming", "oracle", "requests"])
+@pytest.mark.parametrize("store", ["handoff", "consolidated", "replay", "dreaming", "oracle", "requests", "review"])
 @pytest.mark.parametrize("placement", [None, "system", "request", "tail"])
 @pytest.mark.parametrize("gate", [False, True])
 def test_parse_design_valid_shapes(store, placement, gate):
@@ -156,6 +156,26 @@ def tiny_task(tmp_path, monkeypatch, sessions, passing=None):
     return chat
 
 
+@pytest.mark.parametrize("store", ["workspace", "handoff", "consolidated", "replay", "dreaming", "requests", "review"])
+def test_each_sleep_receives_verbatim_request_prefix_for_three_wakes(tmp_path, monkeypatch, store):
+    requests = ["  first\nrequest  ", "second\r\nrequest", "third request"]
+    sessions = [{"id": f"s{i}", "stage": None, "prompt": prompt, "max_steps": 3}
+                for i, prompt in enumerate(requests, 1)]
+    sessions.append({"id": "final", "prompt": "end", "max_steps": 3})
+    chat = tiny_task(tmp_path, monkeypatch, sessions)
+    real_sleep, seen = designs.sleep, []
+
+    def sleep(store, artifact, events, **kwargs):
+        seen.append(kwargs["practice"].get("requests"))
+        return real_sleep(store, artifact, events, **kwargs)
+    monkeypatch.setattr(designs, "sleep", sleep)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", [store], 1, 4096, 700, out, chat)
+    assert seen == [requests[:1], requests[:2], requests[:3]]
+    assert rows(out)[0]["passed"]
+    assert [messages[1]["content"] for messages, _ in chat.starts[:3]] == requests
+
+
 def test_four_wakes_keep_order_snapshots_sleep_seeds_and_stages(tmp_path, monkeypatch):
     sessions = [{"id": "first", "prompt": "one", "max_steps": 4},
                 {"id": "second", "stage": "revision", "prompt": "two", "max_steps": 4},
@@ -193,14 +213,63 @@ def test_four_wakes_keep_order_snapshots_sleep_seeds_and_stages(tmp_path, monkey
                 actual_store, artifact, events, kwargs = sleeps[k * 8 + j * 4 + i]
                 assert actual_store == store and events[0] == {"type": "user", "text": s["prompt"]}
                 assert artifact == (NOTE if store == "handoff" and i else None)
-                assert kwargs["seed"] == k * run.SEED_STRIDE + run.SLEEP_OFFSET + i * run.SESSION_STRIDE
+                assert kwargs["seed"] == k * run.SEED_STRIDE + 50_000 + i * 1_000
                 assert kwargs["practice"] == {
                     "task_id": "tiny", "request": s["prompt"], "ws_before": before, "ws_after": after,
+                    "requests": [session["prompt"] for session in sessions[:i + 1]],
                     "scratch": seed_dir / f"practice_{store}_{sid}", "max_steps": run.PRACTICE_STEPS,
                     "memory_at": "system", "finish_gate": False}
         for row in rows(out)[k * 2:(k + 1) * 2]:
             assert row["valid"] and row["passed"] and row["checks"] == {"test_state": True}
             assert row["wake"] == {"first_passed": False, "second_passed": True, "trap_experienced": False}
+
+
+def test_sleep_seed_range_has_room_and_stays_below_final():
+    assert run.SLEEP_OFFSET == 50_000 and run.SLEEP_STRIDE == 1_000
+    assert [run.SLEEP_OFFSET + i * run.SLEEP_STRIDE for i in range(9)] == [
+        50_000, 51_000, 52_000, 53_000, 54_000, 55_000, 56_000, 57_000, 58_000]
+    assert run.SLEEP_OFFSET + 9 * run.SLEEP_STRIDE < run.FINAL_OFFSET
+
+
+def test_review_logs_each_sleep_in_order_and_reuses_logs_for_final_repeats(tmp_path, monkeypatch):
+    sessions = [{"id": "s1", "stage": None, "prompt": "First user's exact request.", "max_steps": 3},
+                {"id": "s2", "stage": None, "prompt": "Second user's exact request.", "max_steps": 3},
+                {"id": "final", "prompt": "end", "max_steps": 3}]
+    inner = tiny_task(tmp_path, monkeypatch, sessions)
+    items = [{"kind": "rule", "text": "Keep the base policy."}]
+    reviews = []
+
+    def chat(messages, tools=None, **kwargs):
+        if tools is not None:
+            return inner(messages, tools, **kwargs)
+        prompt = messages[0]["content"]
+        if prompt.startswith("USER REQUESTS:\n"):
+            reviews.append(prompt)
+            content = json.dumps({"number": 0, "text": f"Use policy {len(reviews)}."})
+        else:
+            content = json.dumps(items)
+        return {"content": content, "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "seconds": 1.0}
+
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["workspace", "consolidated", "review"], 1, 4096, 700, out, chat, final_repeats=2)
+    result = rows(out)
+    assert len(reviews) == 2
+    for i, prompt in enumerate(reviews, 1):
+        assert prompt.startswith("USER REQUESTS:\n" + designs._archive([s["prompt"] for s in sessions[:i]])
+                                 + "\n\nRULES:\n")
+    expected = [{"number": 0, "text": f"Use policy {i}.", "applied": True, "reason": "", "items_before": items}
+                for i in (1, 2)]
+    for row in result:
+        assert row["passed"] and row["practice_log"] == [] and row["contamination"] == []
+        assert row["review_log"] == (expected if row["store"] == "review" else [])
+        if row["store"] == "review":
+            assert row["memory"] == "- RULE: Use policy 2.\n- RULE: Keep the base policy."
+            assert all(s["prompt"] not in row["memory"] for s in sessions[:2])
+    consolidated, reviewed = result[2], result[4]
+    assert reviewed["sleep_cost"] == {"calls": consolidated["sleep_cost"]["calls"] + 2,
+                                      "prompt_tokens": consolidated["sleep_cost"]["prompt_tokens"] + 20,
+                                      "completion_tokens": consolidated["sleep_cost"]["completion_tokens"] + 10,
+                                      "seconds": consolidated["sleep_cost"]["seconds"] + 2.0}
 
 
 @pytest.mark.parametrize("stages, passing, valid", [

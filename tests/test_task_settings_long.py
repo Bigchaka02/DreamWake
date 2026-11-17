@@ -222,7 +222,7 @@ def test_scripted_run_executes_six_sessions_and_five_sleeps(tmp_path):
     out = tmp_path / "out"
     run.run_experiment(TASK, ["handoff"], 1, 4096, 700, out, chat, wake_retries=0)
     assert starts == [s["prompt"] for s in sessions]
-    assert [seed for seed, _ in sleeps] == [run.SLEEP_OFFSET + i * run.SESSION_STRIDE for i in range(5)]
+    assert [seed for seed, _ in sleeps] == [run.SLEEP_OFFSET + i * run.SLEEP_STRIDE for i in range(5)]
     for (_, messages), session in zip(sleeps, sessions[:-1]):
         assert session["prompt"] in "\n".join(m["content"] for m in messages)
     [row] = [json.loads(line) for line in (out / "results.jsonl").read_text(encoding="utf-8").splitlines()]

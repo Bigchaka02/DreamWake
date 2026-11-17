@@ -28,7 +28,7 @@ def _parse_arguments(raw):
     return value if isinstance(value, dict) else None
 
 
-def chat(messages, tools=None, *, max_tokens, temperature=0.7, seed=None):
+def chat(messages, tools=None, *, max_tokens, temperature=0.7, seed=None, response_format=None):
     model = os.environ.get("DW_MODEL")
     if not model:
         raise RuntimeError("set DW_MODEL to the model id served by the endpoint")
@@ -39,6 +39,8 @@ def chat(messages, tools=None, *, max_tokens, temperature=0.7, seed=None):
         body["tools"] = tools
     if seed is not None:
         body["seed"] = seed
+    if response_format is not None:
+        body["response_format"] = response_format
     request = urllib.request.Request(base_url + "/chat/completions", data=json.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"})
     start = time.perf_counter()

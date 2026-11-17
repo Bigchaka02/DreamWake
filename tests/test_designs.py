@@ -26,6 +26,99 @@ class FakeChat:
                 "seconds": 1.5, "finish_reason": "stop"}
 
 
+def test_schema_and_ask_forward_response_format_only_when_supplied():
+    properties, required = {"number": {"type": "integer"}}, ["number"]
+    response_format = designs._schema("edit", properties, required)
+    assert response_format == {"type": "json_schema", "json_schema": {"name": "edit", "strict": True,
+                               "schema": {"type": "object", "properties": properties, "required": required}}}
+    fake = FakeChat("{}")
+    cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+    assert designs._ask(fake, "prompt", 100, 42, cost, response_format=response_format) == "{}"
+    assert fake.calls[0]["response_format"] is response_format
+
+    def legacy_chat(messages, *, max_tokens, seed):
+        return fake(messages, max_tokens=max_tokens, seed=seed)
+    designs._ask(legacy_chat, "prompt", 100, 42, cost)
+    assert "response_format" not in fake.calls[1]
+    assert cost == {"calls": 2, "prompt_tokens": 100, "completion_tokens": 40, "seconds": 3.0}
+
+
+def test_archive_numbers_verbatim_requests_and_flattens_only_line_breaks():
+    assert designs._archive(["  first\nline  ", "second\r\nline\rlast", ""]) == (
+        "1.   first line  \n2. second line last\n3. ")
+    assert designs._archive([]) == ""
+
+
+def test_edit_replaces_one_item_keeps_kind_and_does_not_mutate_items():
+    items = [{"kind": "rule", "text": "Keep the policy."}, {"kind": "lesson", "text": "Use TIMEOUT_MS."}]
+    before = json.loads(json.dumps(items))
+    candidate, reason = designs._edit(items, 2, "  lEsSoN : Use TIMEOUT_MS for every delay.  ")
+    assert candidate == [items[0], {"kind": "lesson", "text": "Use TIMEOUT_MS for every delay."}]
+    assert reason == "" and items == before
+    assert candidate is not items and candidate[1] is not items[1]
+
+
+def test_edit_adds_a_rule_at_front_and_caps_whole_items_from_end():
+    items = [{"kind": "lesson", "text": f"item {i}"} for i in range(8)]
+    before = json.loads(json.dumps(items))
+    candidate, reason = designs._edit(items, 0, " RULE: New policy. ")
+    assert candidate == [{"kind": "rule", "text": "New policy."}] + items[:7]
+    assert reason == "" and items == before
+    assert designs._edit([], 0, "first") == ([{"kind": "rule", "text": "first"}], "")
+    long = [{"kind": "rule", "text": str(i) * 210} for i in range(4)]
+    candidate, reason = designs._edit(long, 0, "n" * 240)
+    assert candidate == [{"kind": "rule", "text": "n" * 240}] + long[:2] and reason == ""
+    assert len(designs.inject("consolidated", {"items": candidate})) <= designs.NOTE_CAP
+
+
+@pytest.mark.parametrize("number", [-1, 2, 1.0, "1", None, True])
+def test_edit_refuses_bad_numbers_without_mutation(number):
+    items = [{"kind": "rule", "text": "old"}]
+    assert designs._edit(items, number, "new") == (None, "bad number")
+    assert items == [{"kind": "rule", "text": "old"}]
+
+
+@pytest.mark.parametrize("text", ["", "  ", " RULE :  ", "lesson:", "(replaces: unfinished"])
+def test_edit_refuses_empty_cleaned_text_without_mutation(text):
+    items = [{"kind": "rule", "text": "old"}]
+    assert designs._edit(items, 1, text) == (None, "empty text")
+    assert items == [{"kind": "rule", "text": "old"}]
+
+
+def test_edit_preserves_every_old_identifier_anywhere_in_the_capped_memory():
+    items = [{"kind": "rule", "text": "Use `settings.json` and TIMEOUT_MS."}]
+    assert designs._edit(items, 1, "Use TIMEOUT_MS.") == (None, "edit drops identifiers")
+    assert designs._edit(items, 1, "Use settings.json.") == (None, "edit drops identifiers")
+    other = {"kind": "rule", "text": "Keep settings.json and TIMEOUT_MS."}
+    assert designs._edit(items + [other], 1, "General policy.") == (
+        [{"kind": "rule", "text": "General policy."}, other], "")
+    full = items + [{"kind": "rule", "text": "x" * 210}] * 3 + [other]
+    assert designs._edit(full, 1, "n" * 240) == (None, "edit drops identifiers")
+    assert items == [{"kind": "rule", "text": "Use `settings.json` and TIMEOUT_MS."}]
+
+
+def test_edit_refuses_when_capping_drops_the_edited_item_without_mutation():
+    items = [{"kind": "rule", "text": "x" * 210} for _ in range(4)]
+    before = json.loads(json.dumps(items))
+    assert designs._edit(items, 4, "n" * 240) == (None, "does not fit")
+    assert items == before
+    many = [{"kind": "rule", "text": "short"} for _ in range(9)]
+    assert designs._edit(many, 9, "new") == (None, "does not fit")
+
+
+def test_edit_removes_labels_before_text_cap_then_cleans_replaces_tail():
+    assert designs._edit([], 0, "  RULE : " + "x" * 300) == ([{"kind": "rule", "text": "x" * 240}], "")
+    assert designs._edit([], 0, "lesson: Keep policy. (replaces: unfinished") == (
+        [{"kind": "rule", "text": "Keep policy."}], "")
+
+
+@pytest.mark.parametrize("label", ["RULE:", " rule : ", "LeSsOn: ", "LESSON :"])
+def test_parse_items_removes_leading_labels_before_capping_and_cleaning(label):
+    assert designs.parse_items(lines(("lesson", label + "x" * 300))) == [
+        {"kind": "lesson", "text": "x" * 240}]
+    assert designs.parse_items(lines(("rule", label + " (replaces: unfinished"))) == []
+
+
 def test_workspace_design_keeps_nothing_and_costs_nothing():
     fake = FakeChat("unused")
     artifact, cost = designs.sleep("workspace", None, session_events(3), chat=fake, window=4096, reserve=700)
@@ -578,7 +671,7 @@ def test_refine_prompt_is_built_from_the_first_failing_exercise_with_code_genera
     assert refine.endswith("\n\nPROBLEMS:\nThe added text should contain '_MS' but does not\n"
                            "The added text contains '_SECONDS', which must not appear\n\n" + designs.REFINE_INSTRUCTION)
     assert len(sleep_calls(fake)) == 2 + 1 + 1  # consolidation, dream, refine: nothing else asks the model
-    assert not hasattr(designs, "REVIEW_INSTRUCTION")
+    assert not any(p.startswith("USER REQUESTS:\n") for p in prompts(fake))
 
 
 def test_refine_prompt_reports_a_failed_check_with_the_end_of_its_output(tmp_path, spy):
@@ -718,3 +811,121 @@ def test_practice_instruction_texts():
     assert designs.REFINE_INSTRUCTION.startswith("An agent that was given the rules above got this request")
     assert "Never reverse or weaken a rule." in designs.REFINE_INSTRUCTION
     assert designs.REFINE_INSTRUCTION.endswith('{"kind": "rule" or "lesson", "text": "..."}')
+
+
+# --- review ---------------------------------------------------------------------------------------
+
+def review_chat(reply):
+    return FakeChat(lambda prompt: reply if prompt.startswith("USER REQUESTS:\n") else lines(MILLIS, LESSON))
+
+
+@pytest.mark.parametrize("number, text, expected", [
+    (1, "  RULE: Store every duration in milliseconds with the _MS suffix.  ",
+     [{"kind": "rule", "text": "Store every duration in milliseconds with the _MS suffix."}, ITEMS[1]]),
+    (0, "LESSON: List every setting in CHANGES.md.",
+     [{"kind": "rule", "text": "List every setting in CHANGES.md."}] + ITEMS),
+])
+def test_review_applies_one_edit_with_schema_prompt_record_and_exact_extra_cost(number, text, expected):
+    requests = ["Use milliseconds.\nFor all durations.", "Edit the template."]
+    fake = review_chat(json.dumps({"number": number, "text": text}))
+    artifact, cost = sleep("review", fake, {"requests": requests}, seed=42)
+    consolidated, base_cost = sleep("consolidated", review_chat("unused"), None, seed=42)
+    assert artifact == {"items": expected, "review": [{"number": number, "text": text, "applied": True,
+                                                    "reason": "", "items_before": ITEMS}]}
+    assert len(fake.calls) == base_cost["calls"] + 1
+    assert cost == {"calls": base_cost["calls"] + 1, "prompt_tokens": base_cost["prompt_tokens"] + 50,
+                    "completion_tokens": base_cost["completion_tokens"] + 20, "seconds": base_cost["seconds"] + 1.5}
+    assert "practice" not in artifact and consolidated == {"items": ITEMS}
+    *ordinary, review = fake.calls
+    assert all("response_format" not in call for call in ordinary)
+    assert review["response_format"] == designs._schema(
+        "edit", {"number": {"type": "integer"}, "text": {"type": "string"}}, ["number", "text"])
+    assert review["messages"] == [{"role": "user", "content": (
+        "USER REQUESTS:\n1. Use milliseconds. For all durations.\n2. Edit the template.\n\n"
+        + RULES + designs.REVIEW_INSTRUCTION)}]
+    assert review["max_tokens"] == 700 and review["seed"] == 43
+    before = artifact["review"][0]["items_before"]
+    assert all(a is not b for a, b in zip(before, artifact["items"][-2:]))
+    artifact["items"][-1]["text"] = "changed later"
+    assert before == ITEMS
+
+
+@pytest.mark.parametrize("reply, number, text, reason", [
+    ('{"number": -1, "text": ""}', -1, "", ""),
+    ("not JSON", None, None, "invalid reply"),
+    ('[{"number": 0, "text": "new"}]', None, None, "invalid reply"),
+    ('{"number": "0", "text": "new"}', None, None, "invalid reply"),
+    ('{"number": true, "text": "new"}', None, None, "invalid reply"),
+    ('{"number": 1.0, "text": "new"}', None, None, "invalid reply"),
+    ('{"text": "new"}', None, None, "invalid reply"),
+    ('```json\n{"number": 0, "text": "new"}\n```', None, None, "invalid reply"),
+    ('{"number": 0, "text": "a"}\n{"number": 0, "text": "b"}', None, None, "invalid reply"),
+    ('{"number": 3, "text": "new"}', 3, "new", "bad number"),
+    ('{"number": 0, "text": "RULE: "}', 0, "RULE: ", "empty text"),
+    ('{"number": 0}', 0, None, "empty text"),
+    ('{"number": 0, "text": 7}', 0, 7, "empty text"),
+])
+def test_review_records_no_edit_malformed_reply_and_refusals(reply, number, text, reason):
+    fake = review_chat(reply)
+    artifact, cost = sleep("review", fake, {"requests": [REAL]})
+    assert artifact == {"items": ITEMS, "review": [{"number": number, "text": text, "applied": False,
+                                                 "reason": reason, "items_before": ITEMS}]}
+    assert len(fake.calls) == cost["calls"] == 3
+    assert cost == {"calls": 3, "prompt_tokens": 150, "completion_tokens": 60, "seconds": 4.5}
+    assert fake.calls[-1]["seed"] is None
+
+
+def test_review_records_identifier_refusal_and_retains_consolidated_items():
+    items = [{"kind": "rule", "text": "Use TIMEOUT_MS."}]
+    fake = FakeChat(lambda prompt: '{"number": 1, "text": "Use seconds."}'
+                    if prompt.startswith("USER REQUESTS:\n") else json.dumps(items))
+    artifact, _ = sleep("review", fake, {"requests": [REAL]})
+    assert artifact == {"items": items, "review": [{"number": 1, "text": "Use seconds.", "applied": False,
+                                                 "reason": "edit drops identifiers", "items_before": items}]}
+
+
+@pytest.mark.parametrize("practice", [None, {}, {"requests": []}])
+def test_review_skips_extra_call_without_an_archive(practice):
+    fake = review_chat("unused")
+    artifact, cost = sleep("review", fake, practice)
+    assert artifact == {"items": ITEMS, "review": []} and len(fake.calls) == cost["calls"] == 2
+
+
+@pytest.mark.parametrize("room", [100, -50])
+def test_review_prompt_fits_by_cutting_archive_before_rules(room):
+    items = [{"kind": "rule", "text": "x" * 200} for _ in range(4)]
+    rules = designs._numbered(items)
+    base = f"USER REQUESTS:\n\n\nRULES:\n{rules}\n\n" + designs.REVIEW_INSTRUCTION
+    reserve = 100
+    budget = llm.estimate_tokens(base) + room
+    fake = FakeChat(lambda prompt: '{"number": -1, "text": ""}'
+                    if prompt.startswith("USER REQUESTS:\n") else "no candidates")
+    artifact, _ = designs.sleep("review", {"items": items}, session_events(1), chat=fake,
+                               window=budget + reserve + designs.FRAMING_TOKENS, reserve=reserve,
+                               practice={"requests": ["r" * 5000]})
+    prompt = prompts(fake)[-1]
+    assert llm.estimate_tokens(prompt) <= budget
+    archive, shown_rules = prompt.removeprefix("USER REQUESTS:\n").split("\n\nRULES:\n")
+    shown_rules = shown_rules.removesuffix("\n\n" + designs.REVIEW_INSTRUCTION)
+    if room > 0:
+        assert archive.startswith("1. rrr") and len(archive) < 5000 and shown_rules == rules
+    else:
+        assert archive == "" and rules.startswith(shown_rules) and len(shown_rules) < len(rules)
+    assert artifact["items"] == items
+
+
+def test_review_injects_only_items_exactly_like_consolidated():
+    artifact = {"items": ITEMS, "review": [{"text": "SECRET_ARCHIVE"}], "requests": ["SECRET_ARCHIVE"]}
+    assert designs.inject("review", artifact) == designs.inject("consolidated", artifact)
+    assert designs.inject("review", None) == designs.inject("review", {"items": []}) == ""
+
+
+def test_review_instruction_text_is_pinned():
+    assert designs.REVIEW_INSTRUCTION == (
+        "Above are the user's requests on this project, word for word, oldest first, and the RULES the agent will "
+        "carry into its next session. Check that every standing decision of the user (a naming, format, unit or "
+        "process policy meant for all future work, not a one-off task) is stated in the rules as a general "
+        "instruction that keeps the user's exact terms. If one is missing, too narrow or out of date, fix it by "
+        "editing exactly ONE rule: give its number, or 0 to add a new rule, and the full new text of that rule (at "
+        "most 35 words). If the rules already cover every standing decision, answer with number -1 and an empty "
+        "text.")
