@@ -13,6 +13,68 @@ REFERENCE = tasks.load_task(TASK)["reference"]
 NOTE = "Settings live in settings.tmpl.json; durations are in _MS (replaces seconds)."
 
 
+@pytest.mark.parametrize("store", ["handoff", "consolidated", "replay", "dreaming", "oracle", "requests"])
+@pytest.mark.parametrize("placement", [None, "system", "request", "tail"])
+@pytest.mark.parametrize("gate", [False, True])
+def test_parse_design_valid_shapes(store, placement, gate):
+    spec = store + ("@" + placement if placement else "") + ("+gate" if gate else "")
+    assert run.parse_design(spec) == (store, placement or "system", gate)
+
+
+def test_parse_design_workspace():
+    assert run.parse_design("workspace") == ("workspace", "system", False)
+
+
+@pytest.mark.parametrize("spec", ["", "nearby", "unknown", "handoff@", "handoff@user", "handoff@SYSTEM",
+    "handoff+", "handoff+check", "handoff+gate+gate", "handoff@tail+gate+extra", "handoff@@tail",
+    "handoff@tail@system", "handoff+gate@tail", "handoff@tail+", "handoff@tail+check", "handoff ",
+    "workspace@system", "workspace@request", "workspace@tail", "workspace+gate", "workspace@tail+gate"])
+def test_parse_design_rejects_invalid_shapes_before_model_calls(tmp_path, spec):
+    with pytest.raises(ValueError, match="store|placement|suffix|workspace"):
+        run.parse_design(spec)
+
+    def no_chat(*args, **kwargs):
+        pytest.fail("invalid spec reached the model")
+    with pytest.raises(ValueError):
+        run.run_experiment(TASK, ["workspace", spec], 1, 4096, 700, tmp_path / "out", no_chat)
+
+
+@pytest.mark.parametrize("text", [None, "x" * (designs.NOTE_CAP + 1)])
+def test_oracle_missing_or_too_long_fails_before_model_calls(tmp_path, monkeypatch, text):
+    task_dir = tmp_path / TASK
+    task_dir.mkdir()
+    (task_dir / "task.json").write_text((tasks.TASKS_DIR / TASK / "task.json").read_text(encoding="utf-8"),
+                                        encoding="utf-8")
+    if text is not None:
+        (task_dir / "oracle_memory.txt").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path)
+
+    def no_chat(*args, **kwargs):
+        pytest.fail("invalid oracle reached the model")
+    with pytest.raises(ValueError, match="oracle_memory.txt"):
+        run.run_experiment(TASK, ["workspace", "oracle@request"], 1, 4096, 700, tmp_path / "out", no_chat)
+
+
+def test_oracle_uses_pinned_rules_without_sleep_cost_or_practice(tmp_path):
+    expected = (
+        "- RULE: Every duration setting is stored in milliseconds and its name ends in _MS. This also holds "
+        "when a request gives the value in seconds: convert it (30 seconds is stored as TIMEOUT_MS = 30000). "
+        "Functions that return seconds divide by 1000. Counts and sizes are not durations.\n"
+        "- RULE: Settings are defined in settings.tmpl.json. src/settings.py is generated from it by tools/gen.py; "
+        "never edit src/settings.py by hand.\n"
+        "- RULE: Every new or renamed setting must be listed in CHANGES.md, or tools/audit.py fails.")
+    assert (tasks.TASKS_DIR / TASK / "oracle_memory.txt").read_text(encoding="utf-8").strip() == expected
+    out = tmp_path / "out"
+    chat = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")})
+    run.run_experiment(TASK, ["oracle"], 1, 4096, 700, out, chat, final_repeats=2)
+    assert chat.sleep_seeds == []
+    for row in rows(out):
+        assert row["memory"] == expected and row["practice_log"] == [] and row["passed"]
+        assert row["sleep_cost"] == {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+        assert (row["design"], row["store"], row["placement"], row["gate"]) == ("oracle", "oracle", "system", False)
+        assert row["memory_tokens"] == llm.estimate_tokens(agent.MEMORY.format(memory=expected))
+
+
 def writes(name):
     """read_file then write_file for every file of a reference state (existing files must be read first)."""
     root = REFERENCE / name
@@ -109,7 +171,7 @@ def test_consolidated_design_runs_end_to_end_and_injects_its_rules_and_lessons(t
     assert consolidated["sleep_cost"]["prompt_tokens"] == 80 * sleep_calls
 
 
-def test_nearby_final(tmp_path):
+def test_request_spec_uses_safe_labels_and_preserves_design(tmp_path):
     out = tmp_path / "out"
     rule = "Store durations in milliseconds with the _MS suffix."
     inner = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"), "final": perfect("final")},
@@ -124,12 +186,15 @@ def test_nearby_final(tmp_path):
             messages = [messages[0], {"role": "user", "content": prompt}, *messages[2:]]
         return inner(messages, tools, **kwargs)
 
-    run.run_experiment(TASK, ["consolidated", "nearby"], 1, 4096, 700, out, chat, final_repeats=2)
+    run.run_experiment(TASK, ["consolidated", "consolidated@request"], 1, 4096, 700, out, chat, final_repeats=2)
     result = rows(out)
     assert len(result) == 4 and all(r["valid"] and r["passed"] for r in result)
     assert [r["memory"] for r in result] == [f"- RULE: {rule}"] * 4
     assert len({r["memory_tokens"] for r in result}) == 1
     assert result[0]["sleep_cost"] == result[2]["sleep_cost"]
+    assert [(r["design"], r["store"], r["placement"], r["gate"]) for r in result] == [
+        (d, "consolidated", p, False) for d, p in
+        (("consolidated", "system"), ("consolidated@request", "request")) for _ in range(2)]
     prompts = {sid: p for p, sid in SESSIONS.items()}
     note = agent.MEMORY.format(memory=result[0]["memory"])
     sessions = tasks.load_task(TASK)["sessions"]
@@ -140,11 +205,71 @@ def test_nearby_final(tmp_path):
                            {"role": "user", "content": prompts["final"]}]] * 2
     assert starts[4:] == [[{"role": "system", "content": system},
                           {"role": "user", "content": prompts["final"] + note}]] * 2
-    for design in ("consolidated", "nearby"):
+    for design in ("consolidated", "consolidated_at_request"):
         for suffix in ("", ".r1"):
             log = out / "seed0" / f"final_{design}{suffix}.jsonl"
             assert json.loads(log.read_text(encoding="utf-8").splitlines()[0]) == {
                 "type": "user", "text": prompts["final"]}
+            assert (out / "seed0" / f"final_{design}_ws{suffix}").is_dir()
+
+
+@pytest.mark.parametrize("spec", ["handoff+gate", "oracle@request+gate", "requests@tail+gate",
+                                 "replay@request+gate", "dreaming@tail+gate"])
+def test_specs_wire_final_and_practice_placement_and_gate_with_safe_paths(tmp_path, monkeypatch, spec):
+    store, placement, gate = run.parse_design(spec)
+    label = spec.replace("@", "_at_").replace("+", "_")
+    real, seen = agent.run_session, []
+
+    def spy(task_id, workspace, prompt, **kwargs):
+        result = real(task_id, workspace, prompt, **kwargs)
+        seen.append((Path(workspace), prompt, kwargs, result))
+        return result
+    monkeypatch.setattr(agent, "run_session", spy)
+    note = json.dumps({"kind": "rule", "text": "Use milliseconds."})
+    inner = scripted_agent({"s1": perfect("s1"), "s2": perfect("s2"),
+                            "final": perfect("final") + [("finish", {"summary": "checked"})]}, note)
+
+    def chat(messages, tools=None, **kwargs):
+        if tools is not None:
+            prompt = next(p for p in SESSIONS if messages[1]["content"].startswith(p))
+            if any(m.get("tool_calls", [{}])[0].get("function", {}).get("name") == "finish"
+                   for m in messages if m["role"] == "assistant"):
+                return {"content": "", "tool_calls": [{"name": "finish", "arguments": {"summary": "checked"},
+                                                       "raw": "{}"}],
+                        "usage": {"prompt_tokens": 500, "completion_tokens": 50}, "seconds": 1.0,
+                        "finish_reason": "tool_calls"}
+            # The fake model sees the request alone and uses two messages to identify a new session.
+            tail = messages[-1:] if placement == "tail" and len(messages) > 2 and messages[-1]["role"] == "user" else []
+            messages = [messages[0], {"role": "user", "content": prompt}, *messages[2:len(messages) - len(tail)]]
+        return inner(messages, tools, **kwargs)
+
+    out = tmp_path / "out"
+    run.run_experiment(TASK, [spec], 1, 4096, 700, out, chat, final_repeats=2)
+    result = rows(out)
+    assert [(r["design"], r["store"], r["placement"], r["gate"]) for r in result] == [
+        (spec, store, placement, gate)] * 2
+    assert all(r["passed"] for r in result)
+    wakes, finals, practices = seen[:2], [], []
+    for workspace, prompt, kwargs, session in seen[2:]:
+        (finals if workspace.name == "ws_final" else practices).append((workspace, kwargs, session))
+        assert kwargs["memory_at"] == placement and kwargs["finish_gate"] is gate
+        assert session["gated"]
+    assert len(finals) == 2
+    assert all(kwargs["memory"] == "" and not kwargs.get("finish_gate", False) and not session["gated"]
+               for _, _, kwargs, session in wakes)
+    if store in ("replay", "dreaming"):
+        assert practices
+        assert all(workspace.parent.name in (f"practice_{label}_s1", f"practice_{label}_s2")
+                   for workspace, _, _ in practices)
+    else:
+        assert practices == []
+    for suffix in ("", ".r1"):
+        assert (out / "seed0" / f"final_{label}{suffix}.jsonl").is_file()
+        assert (out / "seed0" / f"final_{label}_ws{suffix}").is_dir()
+    if store == "requests":
+        prompts = [s["prompt"] for s in tasks.load_task(TASK)["sessions"][:2]]
+        assert result[0]["memory"] == designs.inject("requests", prompts)
+        assert result[0]["sleep_cost"]["calls"] == 0
 
 
 def tree(root):

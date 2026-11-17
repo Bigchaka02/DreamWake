@@ -159,7 +159,7 @@ def test_system_prompt_states_the_step_budget_and_appends_memory(ws):
     assert fake.calls[0]["messages"][1] == {"role": "user", "content": PROMPT}
 
 
-@pytest.mark.parametrize("memory_at", ["system", "request"])
+@pytest.mark.parametrize("memory_at", ["system", "request", "tail"])
 @pytest.mark.parametrize("memory", ["", "durations use _MS"])
 def test_memory_placement(ws, tmp_path, memory_at, memory):
     log = tmp_path / "session.jsonl"
@@ -178,6 +178,78 @@ def test_memory_placement(ws, tmp_path, memory_at, memory):
 def test_invalid_memory_placement(ws, memory_at):
     with pytest.raises(ValueError, match="memory_at"):
         run(ws, [FINISH], memory_at=memory_at)
+
+
+def test_tail_follows_history_and_overflow_marker_without_entering_events(ws):
+    memory = "durations use _MS"
+    tail = {"role": "user", "content": agent.MEMORY.format(memory=memory).strip()}
+    fake = OverflowOnce([reply(("list_files", {})), reply(("list_files", {})), FINISH], overflow_on=[3])
+    result = agent.run_session(TASK, ws, PROMPT, chat=fake, max_steps=10, window=100_000, reserve=500,
+                               memory=memory, memory_at="tail")
+    assert fake.calls[0]["messages"] == [
+        {"role": "system", "content": agent.SYSTEM.format(max_steps=10)},
+        {"role": "user", "content": PROMPT}, tail]
+    assert fake.calls[1]["messages"][2:-1][0]["role"] == "assistant"
+    assert fake.calls[1]["messages"][-2]["role"] == "tool"
+    retried = fake.calls[-1]["messages"]
+    assert retried[2] == {"role": "user", "content": agent.MARKER}
+    assert retried[3]["role"] == "assistant" and retried[-2]["role"] == "tool"
+    assert all(c["messages"][-1] == tail and c["messages"].count(tail) == 1 for c in fake.calls)
+    assert result["dropped_units"] == 1 and len(result["events"]) == 7
+    assert memory not in json.dumps(result["events"])
+
+
+def test_tail_survives_trimming_and_counts_toward_the_window(ws):
+    memory = "m" * 500
+    _, probe = run(ws, [FINISH], memory=memory, memory_at="tail")
+    first = probe.calls[0]["messages"]
+    reserve = 200
+    window = agent.estimate_prompt(first) + reserve + 600
+    calls = [with_prompt_tokens(reply(("read_file", {"path": "README.md"})), 100_000)] * 8
+    result, fake = run(ws, calls + [FINISH], memory=memory, memory_at="tail", window=window, reserve=reserve)
+    assert result["dropped_units"] > 0
+    assert all(c["messages"][-1] == first[-1] for c in fake.calls)
+    assert all(agent.estimate_prompt(c["messages"]) <= window - reserve for c in fake.calls)
+    with pytest.raises(ValueError, match="window"):
+        run(ws, [FINISH], memory=memory, memory_at="tail", reserve=reserve,
+            window=agent.estimate_prompt(first) + reserve - 1)
+
+
+def test_empty_memory_sends_identical_messages_across_all_placements(ws):
+    messages = []
+    for placement in ("system", "request", "tail"):
+        _, fake = run(ws, [reply(("list_files", {})), FINISH], memory_at=placement)
+        messages.append([c["messages"] for c in fake.calls])
+    assert messages[0] == messages[1] == messages[2]
+
+
+@pytest.mark.parametrize("memory_at", ["system", "request", "tail"])
+def test_finish_gate_fires_once_on_the_first_valid_finish_and_records_the_result(ws, memory_at):
+    memory = "- RULE: use _MS"
+    expected = ("Not finished yet. First check your changes against each of these notes, one by one:\n"
+                + memory + "\nIf a change breaks a note, fix it and run the checks again. Then call finish.")
+    result, fake = run(ws, [reply(("finish", {})), FINISH, reply(("list_files", {})), FINISH],
+                       memory=memory, memory_at=memory_at, finish_gate=True)
+    assert agent.GATE.format(memory=memory) == expected
+    assert result["gated"] and result["finished"] and result["steps"] == 4
+    assert results(result)[0].startswith("error")
+    assert results(result)[1] == expected and results(result)[-1] == "finished"
+    assert [e for e in result["events"] if e["type"] == "result" and e["text"] == expected] == [
+        {"type": "result", "step": 2, "text": expected}]
+    assert any(m.get("role") == "tool" and m["content"] == expected for m in fake.calls[2]["messages"])
+
+
+@pytest.mark.parametrize("memory, finish_gate", [("", True), ("", False), ("note", False)])
+def test_finish_gate_is_inactive_without_memory_or_when_disabled(ws, memory, finish_gate):
+    result, fake = run(ws, [FINISH], memory=memory, finish_gate=finish_gate)
+    assert not result["gated"] and result["finished"] and len(fake.calls) == 1
+    assert results(result) == ["finished"]
+
+
+def test_step_cap_after_finish_gate_is_reported_as_max_steps(ws):
+    result, _ = run(ws, [FINISH], memory="note", finish_gate=True, max_steps=1)
+    assert result["gated"] and not result["finished"] and result["steps"] == 1
+    assert result["ended_by"] == "max_steps" and result["ran_out_of_steps"]
 
 
 def test_seed_differs_per_step(ws):

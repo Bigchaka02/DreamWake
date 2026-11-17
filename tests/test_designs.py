@@ -34,6 +34,54 @@ def test_workspace_design_keeps_nothing_and_costs_nothing():
     assert designs.inject("workspace", artifact) == ""
 
 
+def test_requests_sleep_keeps_every_verbatim_request_without_model_calls():
+    fake = FakeChat("unused")
+    first = "  First request\nwith two lines.  "
+    second = "Second request"
+    artifact, cost = designs.sleep("requests", None, session_events(1, first), chat=fake, window=4096, reserve=700)
+    assert artifact == [first]
+    saved = artifact
+    artifact, cost2 = designs.sleep("requests", artifact, session_events(2, second),
+                                   chat=fake, window=4096, reserve=700)
+    assert artifact == [first, second] and saved == [first] and fake.calls == []
+    assert cost == cost2 == {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+
+
+@pytest.mark.parametrize("artifact", [None, []])
+def test_requests_empty_artifact_renders_empty(artifact):
+    assert designs.inject("requests", artifact) == ""
+
+
+def test_requests_render_in_original_order_with_original_numbers_and_flattened_line_breaks():
+    assert designs.inject("requests", ["first\nline", "second\r\nline\r", ""]) == (
+        "- USER REQUEST 1: first line\n- USER REQUEST 2: second line \n- USER REQUEST 3: ")
+
+
+def test_requests_whole_request_at_the_cap_is_not_cut():
+    prefix = "- USER REQUEST 2: "
+    text = "n" * (designs.NOTE_CAP - len(prefix))
+    assert designs.inject("requests", ["older", text]) == prefix + text
+
+
+@pytest.mark.parametrize("kept", [79, 80, 140])
+def test_requests_cut_requires_eighty_text_characters_and_stops_before_older_requests(kept):
+    prefix2, prefix3, marker = "- USER REQUEST 2: ", "- USER REQUEST 3: ", " [...]"
+    newest = "n" * (designs.NOTE_CAP - len(prefix2 + prefix3 + marker) - 1 - kept)
+    artifact = ["ancient", "o" * 1000, newest]
+    expected = (prefix2 + "o" * kept + marker + "\n" if kept >= 80 else "") + prefix3 + newest
+    rendered = designs.inject("requests", artifact)
+    assert rendered == expected and len(rendered) <= designs.NOTE_CAP
+    assert "ancient" not in rendered
+
+
+def test_requests_newest_oversize_request_is_cut_to_the_cap():
+    prefix = "- USER REQUEST 10: "
+    marker = " [...]"
+    artifact = ["old"] * 9 + ["x" * 2000]
+    expected = prefix + "x" * (designs.NOTE_CAP - len(prefix + marker)) + marker
+    assert designs.inject("requests", artifact) == expected
+
+
 def test_handoff_sends_previous_note_and_the_transcript_tail_that_fits():
     fake = FakeChat("  new note  ")
     window, reserve = 1000, 300
@@ -208,27 +256,12 @@ def test_consolidated_inject_formats_rules_and_lessons_in_order():
     assert designs.inject("consolidated", None) == "" and designs.inject("consolidated", {"items": []}) == ""
 
 
-def test_nearby_sleep():
-    artifacts = {"consolidated": None, "nearby": None}
-    for item in (SECONDS, MILLIS):
-        outputs = []
-        for design in artifacts:
-            fake = memory_chat(lines(item, LESSON), lines(item, LESSON))
-            artifact, cost = designs.sleep(design, artifacts[design], session_events(2), chat=fake,
-                                           window=4096, reserve=700, seed=42)
-            artifacts[design] = artifact
-            outputs.append((artifact, cost, fake.calls))
-        assert outputs[0] == outputs[1]
-    assert artifacts["nearby"] == {"items": [{"kind": "rule", "text": MILLIS[1]},
-                                            {"kind": "lesson", "text": LESSON[1]}]}
-
-
-@pytest.mark.parametrize("artifact", [None, {"items": []},
-                                    {"items": [{"kind": "rule", "text": MILLIS[1]},
-                                               {"kind": "lesson", "text": LESSON[1]}]}])
-def test_nearby_inject(artifact):
-    assert designs.inject("nearby", artifact) == designs.inject("consolidated", artifact)
-    assert designs.AT_REQUEST == {"nearby"}
+def test_nearby_store_and_at_request_constant_are_removed():
+    assert not hasattr(designs, "AT_REQUEST")
+    with pytest.raises(ValueError, match="unknown design"):
+        designs.inject("nearby", None)
+    with pytest.raises(ValueError, match="unknown design"):
+        designs.sleep("nearby", None, session_events(1), chat=FakeChat(""), window=4096, reserve=700)
 
 
 def test_consolidated_cost_sums_every_call():
@@ -298,8 +331,9 @@ def practice_chat(refine=lines(SPECIFIC, LESSON), dream=dream_lines(*DREAMS), wr
         chat.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens, "seed": seed})
         usage = {"prompt_tokens": 50, "completion_tokens": 20}
         if tools:
-            if len(messages) == 2:
-                plan = writes(messages[1]["content"], SPECIFIC[1] in messages[0]["content"]) if callable(writes) \
+            if not any(m["role"] == "assistant" for m in messages[2:]):
+                request = messages[1]["content"].partition(agent.MEMORY.format(memory=""))[0]
+                plan = writes(request, any(SPECIFIC[1] in m["content"] for m in messages)) if callable(writes) \
                     else writes
                 state["queue"] = [("write_file", {"path": p, "content": c}) for p, c in plan]
             name, args = state["queue"].pop(0) if state["queue"] else ("finish", {"summary": "done"})
@@ -328,7 +362,8 @@ def spy(monkeypatch):
     def run_session(task_id, workspace, prompt, **kwargs):
         mark = (Path(workspace) / "MARK.txt").read_text(encoding="utf-8")
         seen.append({"mark": mark, "request": prompt, "memory": kwargs["memory"], "workspace": Path(workspace),
-                     "max_steps": kwargs["max_steps"], "seed": kwargs["seed"]})
+                     "max_steps": kwargs["max_steps"], "seed": kwargs["seed"],
+                     "memory_at": kwargs.get("memory_at", "system"), "finish_gate": kwargs.get("finish_gate", False)})
         return real(task_id, workspace, prompt, **kwargs)
     monkeypatch.setattr(designs.agent, "run_session", run_session)
     return seen
@@ -337,6 +372,23 @@ def spy(monkeypatch):
 def sleep(design, fake, practice, window=4096, reserve=700, seed=None):
     return designs.sleep(design, None, session_events(2), chat=fake, window=window, reserve=reserve, seed=seed,
                          practice=practice)
+
+
+@pytest.mark.parametrize("design", ["replay", "dreaming"])
+@pytest.mark.parametrize("options", [{}, {"memory_at": "request", "finish_gate": True},
+                                    {"memory_at": "tail", "finish_gate": True}])
+def test_practice_attempts_and_candidates_receive_placement_and_gate(tmp_path, spy, design, options):
+    practice = {**snapshots(tmp_path, passing=False), **options}
+    fake = practice_chat()
+    artifact, cost = sleep(design, fake, practice)
+    assert artifact["practice"][0]["refined"] and cost["practice_sessions"] == 4
+    placement, gate = options.get("memory_at", "system"), options.get("finish_gate", False)
+    assert [(s["memory_at"], s["finish_gate"]) for s in spy] == [(placement, gate)] * 4
+    for session in spy:
+        lines = [json.loads(line) for line in session["workspace"].with_suffix(".jsonl").read_text(
+            encoding="utf-8").splitlines()]
+        gated = [e for e in lines if e["type"] == "result" and e["text"] == agent.GATE.format(memory=session["memory"])]
+        assert len(gated) == int(gate)
 
 
 def instruction_prompts(fake, instruction):

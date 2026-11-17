@@ -20,6 +20,21 @@ SLEEP_OFFSET = 98_000  # likewise for the sleep calls; stays clear of the wake a
 PRACTICE_STEPS = 20  # step cap of one practice session during the dreaming / replay sleep (same as a real session)
 
 
+def parse_design(spec):
+    """Parse store[@placement][+gate], rejecting unsupported combinations."""
+    base, plus, suffix = spec.partition("+")
+    if plus and suffix != "gate":
+        raise ValueError(f"unknown design suffix: {suffix!r}; expected '+gate'")
+    store, at, placement = base.partition("@")
+    if store not in ("workspace", "handoff", "consolidated", "replay", "dreaming", "oracle", "requests"):
+        raise ValueError(f"unknown store: {store!r}")
+    if at and placement not in ("system", "request", "tail"):
+        raise ValueError(f"unknown placement: {placement!r}")
+    if store == "workspace" and (at or plus):
+        raise ValueError("workspace cannot have a placement or gate")
+    return store, placement if at else "system", bool(plus)
+
+
 def _git(*args):
     try:
         proc = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True)
@@ -53,9 +68,10 @@ def _wrote_trap(events, trap_paths, workspace):
     return False
 
 
-def _session(task_id, session, workspace, chat, window, reserve, seed, log_path, memory="", *, memory_at="system"):
+def _session(task_id, session, workspace, chat, window, reserve, seed, log_path, memory="", *, memory_at="system",
+             finish_gate=False):
     return agent.run_session(task_id, workspace, session["prompt"], max_steps=session["max_steps"], window=window,
-                             reserve=reserve, chat=chat, memory=memory, memory_at=memory_at,
+                             reserve=reserve, chat=chat, memory=memory, memory_at=memory_at, finish_gate=finish_gate,
                              seed=seed, log_path=log_path)
 
 
@@ -89,18 +105,23 @@ def _wake(task_id, sessions, seed_dir, k, chat, window, reserve, wake_retries):
 
 
 def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window, reserve, trap_paths,
-           final_repeats=1):
+           final_repeats=1, oracle_memory=""):
+    store, placement, gate = parse_design(design)
+    label = design.replace("@", "_at_").replace("+", "_")
     artifact, sleep_cost = None, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     practice_log = []
-    for i, (sid, events) in enumerate(zip(("s1", "s2"), wake["events"])):
-        practice = {"task_id": task_id, "request": sessions[sid]["prompt"],
-                    "ws_before": seed_dir / f"snap_{sid}_before", "ws_after": seed_dir / f"snap_{sid}_after",
-                    "scratch": seed_dir / f"practice_{design}_{sid}", "max_steps": PRACTICE_STEPS}
-        artifact, cost = designs.sleep(design, artifact, events, chat=chat, window=window, reserve=reserve,
-                                       seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SESSION_STRIDE, practice=practice)
-        sleep_cost = {key: sleep_cost.get(key, 0) + value for key, value in cost.items()}
-        practice_log += artifact.get("practice", []) if isinstance(artifact, dict) else []
-    memory = designs.inject(design, artifact)
+    memory = oracle_memory
+    if store != "oracle":
+        for i, (sid, events) in enumerate(zip(("s1", "s2"), wake["events"])):
+            practice = {"task_id": task_id, "request": sessions[sid]["prompt"],
+                        "ws_before": seed_dir / f"snap_{sid}_before", "ws_after": seed_dir / f"snap_{sid}_after",
+                        "scratch": seed_dir / f"practice_{label}_{sid}", "max_steps": PRACTICE_STEPS,
+                        "memory_at": placement, "finish_gate": gate}
+            artifact, cost = designs.sleep(store, artifact, events, chat=chat, window=window, reserve=reserve,
+                                           seed=k * SEED_STRIDE + SLEEP_OFFSET + i * SESSION_STRIDE, practice=practice)
+            sleep_cost = {key: sleep_cost.get(key, 0) + value for key, value in cost.items()}
+            practice_log += artifact.get("practice", []) if isinstance(artifact, dict) else []
+        memory = designs.inject(store, artifact)
     workspace = seed_dir / "ws_final"  # the same path for every design: the path must not name the design
     rows = []
     for r in range(final_repeats):
@@ -109,11 +130,10 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
         suffix = f".r{r}" if r else ""
         seed = k * SEED_STRIDE + FINAL_OFFSET + r * SESSION_STRIDE
         result = _session(task_id, sessions["final"], workspace, chat, window, reserve, seed,
-                          seed_dir / f"final_{design}{suffix}.jsonl", memory,
-                          memory_at="request" if design in designs.AT_REQUEST else "system")
+                          seed_dir / f"final_{label}{suffix}.jsonl", memory, memory_at=placement, finish_gate=gate)
         evaluation = tasks.evaluate(task_id, "final", workspace, baseline_dir=baseline)
         repeated = _wrote_trap(result["events"], trap_paths, workspace)
-        archive = seed_dir / f"final_{design}_ws{suffix}"
+        archive = seed_dir / f"final_{label}_ws{suffix}"
         shutil.rmtree(archive, ignore_errors=True)
         shutil.move(workspace, archive)
         rows.append({"repeat": r, "checks": evaluation["checks"], "passed": evaluation["passed"],
@@ -129,9 +149,17 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
 
 
 def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3, final_repeats=1):
-    for design in designs_:
-        designs.inject(design, None)  # fail fast on an unknown design name, before any LLM call
+    parsed = [parse_design(design) for design in designs_]  # validate every spec before any model call
     task = tasks.load_task(task_id)
+    oracle_memory = ""
+    if any(store == "oracle" for store, _, _ in parsed):
+        path = task["dir"] / "oracle_memory.txt"
+        try:
+            oracle_memory = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            raise ValueError(f"missing oracle_memory.txt for task {task_id!r}") from None
+        if len(oracle_memory) > designs.NOTE_CAP:
+            raise ValueError(f"oracle_memory.txt exceeds NOTE_CAP ({designs.NOTE_CAP} characters)")
     sessions = {s["id"]: s for s in task["sessions"]}
     trap_paths = set(task.get("trap_paths", []))
     out = Path(out_dir)
@@ -158,13 +186,14 @@ def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wak
                 baseline = seed_dir / "baseline"
                 shutil.rmtree(baseline, ignore_errors=True)
                 tasks._copy(wake_ws, baseline)
-            for design in designs_:
+            for design, (store, placement, gate) in zip(designs_, parsed):
                 row = {"task": task_id, "seed": k, "design": design, "model": model, "window": window,
+                       "store": store, "placement": placement, "gate": gate,
                        "reserve": reserve, "wake_attempts": wake["attempts"], "wake": flags, "valid": bool(wake_ws)}
                 if wake_ws:
                     rows.extend({**row, **final} for final in _final(
                         task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat, window,
-                        reserve, trap_paths, final_repeats))
+                        reserve, trap_paths, final_repeats, oracle_memory))
                 else:
                     rows.append(row)
         except (RuntimeError, OSError) as error:  # a transport or evaluator fault loses this seed, not the run

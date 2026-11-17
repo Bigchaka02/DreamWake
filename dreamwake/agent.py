@@ -13,6 +13,8 @@ MEMORY = ("\n\nNotes carried over from your earlier sessions on this project "
           "(your conversation memory was wiped since then):\n{memory}")
 MARKER = "[earlier steps omitted to fit the context window]"
 NUDGE = "Use a tool. Call finish when the work is done."
+GATE = ("Not finished yet. First check your changes against each of these notes, one by one:\n"
+        "{memory}\nIf a change breaks a note, fix it and run the checks again. Then call finish.")
 READ_CAP = 3000
 RENDER_CAP = 600
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
@@ -84,9 +86,9 @@ def _execute(task_id, workspace, name, args, known):
 
 
 def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat, memory="", memory_at="system",
-                seed=None, log_path=None):
-    if memory_at not in ("system", "request"):
-        raise ValueError("memory_at must be 'system' or 'request'")
+                finish_gate=False, seed=None, log_path=None):
+    if memory_at not in ("system", "request", "tail"):
+        raise ValueError("memory_at must be 'system', 'request' or 'tail'")
     workspace = Path(workspace).resolve()
     note = MEMORY.format(memory=memory) if memory else ""
     system = SYSTEM.format(max_steps=max_steps) + (note if memory_at == "system" else "")
@@ -97,6 +99,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
     log = list(events)
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "max_prompt_tokens": 0}
     steps, finished, silent, overflow, start = 0, False, 0, False, time.perf_counter()
+    gated = False
     known, ratio = set(), 1.0  # ratio: the server's prompt token count over our estimate, once measured
     try:
         while steps < max_steps and not finished and silent < 2:
@@ -105,6 +108,8 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
             while reply is None:
                 messages = (pinned + ([{"role": "user", "content": MARKER}] if dropped else [])
                             + [m for unit in units[dropped:] for m in unit])
+                if memory_at == "tail" and memory:
+                    messages.append({"role": "user", "content": MEMORY.format(memory=memory).strip()})
                 raw = estimate_prompt(messages)
                 if raw * ratio > window - reserve:
                     if dropped == len(units):
@@ -141,6 +146,9 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
                     event["content"] = content
                 text = _execute(task_id, workspace, call["name"], call["arguments"], known)
                 finished = call["name"] == "finish" and not text.startswith("error")
+                if finished and finish_gate and memory and not gated:
+                    text = GATE.format(memory=memory)
+                    finished, gated = False, True
                 new = [event, {"type": "result", "step": steps, "text": text}]
                 # LM Studio rejects (HTTP 500) or garbles a replayed call whose arguments are not a JSON object
                 units.append([{"role": "assistant", "content": content, "tool_calls": [
@@ -159,7 +167,7 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
             Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             Path(log_path).write_text("".join(json.dumps(line) + "\n" for line in log), encoding="utf-8")
     ended_by = "finish" if finished else "overflow" if overflow else "no_tool_calls" if silent >= 2 else "max_steps"
-    return {"finished": finished, "steps": steps, "ended_by": ended_by,
+    return {"finished": finished, "gated": gated, "steps": steps, "ended_by": ended_by,
             "ran_out_of_steps": ended_by == "max_steps", "overflow": overflow,
             "events": events, **totals, "seconds": time.perf_counter() - start, "dropped_units": dropped}
 

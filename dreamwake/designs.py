@@ -8,8 +8,6 @@ from . import agent, tasks
 from .agent import render_chunks, render_events
 from .llm import CHARS_PER_TOKEN, estimate_tokens
 
-AT_REQUEST = {"nearby"}
-
 HANDOFF_INSTRUCTION = (
     "Your conversation memory is about to be erased. Write a handoff note to yourself, at most 120 words; it is the "
     "only thing you will remember next time. Cover: 1) the goal and the current state; 2) decisions and project "
@@ -216,6 +214,8 @@ def _practise(design, items, practice, chat, window, reserve, seed, cost):
         tasks._copy(snapshot, sandbox)  # never run in the snapshot itself
         result = agent.run_session(practice["task_id"], sandbox, exercise["request"],
                                    memory=inject("consolidated", {"items": memory_items}),
+                                   memory_at=practice.get("memory_at", "system"),
+                                   finish_gate=practice.get("finish_gate", False),
                                    max_steps=practice["max_steps"], window=window, reserve=reserve, chat=chat,
                                    seed=fresh(practice["max_steps"] + 1), log_path=sandbox.with_suffix(".jsonl"))
         for key in ("prompt_tokens", "completion_tokens", "seconds"):
@@ -276,6 +276,8 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
     cost = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
     if design == "workspace":
         return None, cost
+    if design == "requests":
+        return (artifact or []) + [events[0]["text"]], cost
     if design == "handoff":
         request, rest = events[0]["text"], events[1:]  # the session's user request, pinned like in the live agent
         head = f"Your previous handoff note:\n{artifact}\n\n" if artifact else ""
@@ -286,7 +288,7 @@ def sleep(design, artifact, events, *, chat, window, reserve, seed=None, practic
         reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve, seed=seed)
         cost = {"calls": 1, **reply["usage"], "seconds": reply["seconds"]}
         return (reply["content"] or "").strip()[:NOTE_CAP], cost
-    if design in ("consolidated", "nearby"):
+    if design == "consolidated":
         return _consolidate(artifact, events, chat, window, reserve, seed)
     if design in ("dreaming", "replay"):
         artifact, cost = _consolidate(artifact, events, chat, window, reserve, seed)
@@ -301,7 +303,22 @@ def inject(design, artifact):
         return ""
     if design == "handoff":
         return artifact or ""
-    if design in ("consolidated", "nearby", "dreaming", "replay"):  # practice requests are never injected
+    if design == "requests":
+        requests = artifact or []
+        kept, remaining = [], NOTE_CAP
+        for i in reversed(range(len(requests))):
+            prefix = f"- USER REQUEST {i + 1}: "
+            text = requests[i].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+            space = remaining - (1 if kept else 0) - len(prefix)
+            if len(text) > space:
+                marker = " [...]"
+                if space - len(marker) >= 80:
+                    kept.append(prefix + text[:space - len(marker)] + marker)
+                break
+            kept.append(prefix + text)
+            remaining -= len(prefix + text) + (1 if len(kept) > 1 else 0)
+        return "\n".join(reversed(kept))
+    if design in ("consolidated", "dreaming", "replay"):  # practice requests are never injected
         items = artifact["items"] if artifact else []
         return "\n".join(f"- {item['kind'].upper()}: {item['text']}" for item in items)
     raise ValueError(f"unknown design: {design!r}")

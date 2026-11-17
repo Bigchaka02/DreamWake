@@ -1,0 +1,3 @@
+- RULE: Every duration setting is stored in milliseconds and its name ends in _MS. This also holds when a request gives the value in seconds: convert it (30 seconds is stored as TIMEOUT_MS = 30000). Functions that return seconds divide by 1000. Counts and sizes are not durations.
+- RULE: Settings are defined in settings.tmpl.json. src/settings.py is generated from it by tools/gen.py; never edit src/settings.py by hand.
+- RULE: Every new or renamed setting must be listed in CHANGES.md, or tools/audit.py fails.
