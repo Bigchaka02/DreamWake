@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# bulky / local-only artifacts (metadata to reproduce lives in the repo)
+runs/
+.refs/
+*.gguf
+*.safetensors

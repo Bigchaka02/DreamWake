@@ -1,0 +1,4 @@
+{
+  "RETRIES": {"type": "int", "value": 3},
+  "BASE_URL": {"type": "str", "value": "http://localhost"}
+}

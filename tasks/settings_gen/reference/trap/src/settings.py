@@ -1,0 +1,4 @@
+RETRIES = 3
+BASE_URL = 'http://localhost'
+TIMEOUT_MS = 30000
+BACKOFF_MS = 2000

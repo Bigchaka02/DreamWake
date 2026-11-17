@@ -1,0 +1,5 @@
+{
+  "RETRIES": {"type": "int", "value": 3},
+  "BASE_URL": {"type": "str", "value": "http://localhost"},
+  "TIMEOUT_S": {"type": "int", "value": 30}
+}
