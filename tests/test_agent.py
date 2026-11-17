@@ -209,6 +209,31 @@ def test_bad_arguments_and_unknown_tools_give_error_results(ws):
     assert result["events"][1]["args"] == {"raw": "{bad"}
 
 
+class StrictServerChat(FakeChat):
+    """Like LM Studio: a replayed tool call whose arguments are "" or invalid JSON gets HTTP 500, and a
+    non-object (e.g. '"a.txt"') silently garbles the prompt, so anything but a JSON object string fails here."""
+    def __call__(self, messages, tools=None, **kwargs):
+        for message in messages:
+            for call in message.get("tool_calls") or []:
+                try:
+                    ok = isinstance(json.loads(call["function"]["arguments"]), dict)
+                except ValueError:
+                    ok = False
+                if not ok:
+                    raise RuntimeError("HTTP 500 from server: Internal Server Error")
+        return super().__call__(messages, tools, **kwargs)
+
+
+@pytest.mark.parametrize("raw, replayed", [("{bad", {"raw": "{bad"}), ("", {}), ('"a.txt"', {"raw": '"a.txt"'})])
+def test_replayed_tool_calls_always_carry_a_json_object(ws, raw, replayed):
+    bad = reply(("read_file", {}))
+    bad["tool_calls"][0].update(raw=raw, arguments=llm._parse_arguments(raw))
+    fake = StrictServerChat([bad, FINISH])
+    result = agent.run_session(TASK, ws, PROMPT, chat=fake, max_steps=10, window=100_000, reserve=500)
+    assert result["finished"] and results(result)[0].startswith("error")
+    assert json.loads(fake.calls[1]["messages"][2]["tool_calls"][0]["function"]["arguments"]) == replayed
+
+
 def test_only_the_first_tool_call_of_a_reply_is_executed(ws):
     result, fake = run(ws, [reply(("write_file", {"path": "one.txt", "content": "1"}),
                                   ("write_file", {"path": "two.txt", "content": "2"})), FINISH])

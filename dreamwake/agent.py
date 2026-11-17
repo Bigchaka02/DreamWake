@@ -125,9 +125,11 @@ def run_session(task_id, workspace, prompt, *, max_steps, window, reserve, chat,
                 text = _execute(task_id, workspace, call["name"], call["arguments"])
                 finished = call["name"] == "finish" and not text.startswith("error")
                 new = [event, {"type": "result", "step": steps, "text": text}]
+                # LM Studio rejects (HTTP 500) or garbles a replayed call whose arguments are not a JSON object
                 units.append([{"role": "assistant", "content": content, "tool_calls": [
-                                  {"id": call_id, "type": "function",
-                                   "function": {"name": call["name"], "arguments": call["raw"]}}]},
+                                  {"id": call_id, "type": "function", "function": {
+                                      "name": call["name"],
+                                      "arguments": json.dumps(event["args"], ensure_ascii=False)}}]},
                               {"role": "tool", "tool_call_id": call_id, "content": text}])
             else:
                 silent += 1

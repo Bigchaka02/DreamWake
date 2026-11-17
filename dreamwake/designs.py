@@ -17,11 +17,12 @@ def sleep(design, artifact, events, *, chat, window, reserve):
     if design == "workspace":
         return None, cost
     if design == "handoff":
+        request, rest = events[0]["text"], events[1:]  # the session's user request, pinned like in the live agent
         head = f"Your previous handoff note:\n{artifact}\n\n" if artifact else ""
-        head += "The end of the session, as you can still see it:\n"
+        head += f"The request for this session:\n{request}\n\nThe end of the session, as you can still see it:\n"
         tail = "\n\n" + HANDOFF_INSTRUCTION
         max_chars = max(0, int(CHARS_PER_TOKEN * (window - reserve - estimate_tokens(head + tail) - FRAMING_TOKENS)))
-        prompt = head + render_events(events, max_chars) + tail
+        prompt = head + render_events(rest, max_chars) + tail
         reply = chat([{"role": "user", "content": prompt}], max_tokens=reserve)
         cost = {"calls": 1, **reply["usage"], "seconds": reply["seconds"]}
         return (reply["content"] or "").strip()[:NOTE_CAP], cost

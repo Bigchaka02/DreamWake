@@ -4,8 +4,8 @@ import pytest
 from dreamwake import agent, designs, llm
 
 
-def session_events(n):
-    events = [{"type": "user", "text": "SESSION PROMPT"}]
+def session_events(n, request="SESSION PROMPT"):
+    events = [{"type": "user", "text": request}]
     for step in range(1, n + 1):
         events += [{"type": "call", "step": step, "tool": "read_file", "args": {"path": f"file{step}.py"}},
                    {"type": "result", "step": step, "text": f"result {step} " + "x" * 300}]
@@ -44,15 +44,29 @@ def test_handoff_sends_previous_note_and_the_transcript_tail_that_fits():
     assert message["role"] == "user" and llm.estimate_tokens(prompt) <= window - reserve
     assert "OLD NOTE" in prompt and designs.HANDOFF_INSTRUCTION in prompt
     assert "STEP 30 read_file(path='file30.py')" in prompt  # the most recent step is kept
-    assert "STEP 1 " not in prompt and "SESSION PROMPT" not in prompt  # the oldest part is not
+    assert "STEP 1 " not in prompt  # the oldest steps are not
     assert prompt.index("OLD NOTE") < prompt.index("STEP 30") < prompt.index(designs.HANDOFF_INSTRUCTION)
 
 
-def test_handoff_without_previous_note_sends_the_whole_short_transcript():
+def test_handoff_keeps_the_session_request_in_full_between_the_note_and_the_tail():
     fake = FakeChat("note")
-    designs.sleep("handoff", None, session_events(2), chat=fake, window=4096, reserve=700)
+    window, reserve = 1000, 300
+    request = "REQUEST START " + "r" * 1000 + " REQUEST END"  # longer than the transcript's per-event cap
+    designs.sleep("handoff", "OLD NOTE", session_events(30, request), chat=fake, window=window, reserve=reserve)
     prompt = fake.calls[0]["messages"][0]["content"]
-    assert agent.render_events(session_events(2)) in prompt and "previous" not in prompt.lower()
+    assert llm.estimate_tokens(prompt) <= window - reserve
+    assert prompt.count(request) == 1 and "STEP 30 " in prompt and "STEP 1 " not in prompt
+    assert (prompt.index("OLD NOTE") < prompt.index(request) < prompt.index("STEP 30")
+            < prompt.index(designs.HANDOFF_INSTRUCTION))
+
+
+def test_handoff_without_previous_note_sends_the_request_and_the_whole_short_transcript():
+    fake = FakeChat("note")
+    events = session_events(2)
+    designs.sleep("handoff", None, events, chat=fake, window=4096, reserve=700)
+    prompt = fake.calls[0]["messages"][0]["content"]
+    assert prompt.count("SESSION PROMPT") == 1 and "previous" not in prompt.lower()
+    assert prompt.index("SESSION PROMPT") < prompt.index(agent.render_events(events[1:]))
 
 
 def test_handoff_note_is_capped():
