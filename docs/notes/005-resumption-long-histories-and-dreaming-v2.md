@@ -269,5 +269,5 @@ remain work, not results. Documentation changes require the owner's say-so.
 
 Evidence: `results.jsonl`, practice logs and session traces in the named run
 folders. `tables.txt` and `report_analysis_long.txt` are under
-`runs/docs-update-2026-11-18/` (local, not versioned). The literature review
+`runs/context-2026-11-18_compact_protected/` (local, not versioned). The literature review
 records the research that informed the second version.

@@ -153,7 +153,7 @@ recommendation.
    design, evidence, where it breaks, next experiment, where gains live.
 
 Commands are in file 5. Run folders and the brief under
-`runs/docs-update-2026-11-18/` are local, not versioned.
+`runs/context-2026-11-18_compact_protected/` are local, not versioned.
 
 ### For the owner
 

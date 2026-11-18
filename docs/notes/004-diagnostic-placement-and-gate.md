@@ -107,7 +107,7 @@ running out of steps.
 Source records: `results.jsonl` and final traces in the named local run
 folders. The read-only analyses `report_analysis_smoke.txt` and
 `report_analysis_diag.txt`, and the checked `tables.txt`, are in
-`runs/docs-update-2026-11-18/` (local, not versioned).
+`runs/context-2026-11-18_compact_protected/` (local, not versioned).
 
 ## Decisions this changed
 

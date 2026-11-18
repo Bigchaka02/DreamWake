@@ -121,7 +121,7 @@ Qwen 3.5 9B, window 4096, 20 steps. Completion:
   Three ChatGPT 6.1 live-search jobs covered practice, rule application and
   evaluation. An Opus subagent condensed them into the literature review
   (`644f488`); eight sources' numbers were checked against page text.
-- Research reports remain in `runs/research-2026-11-16/` (local, not
+- Research reports remain in `runs/research-2026-11-16_compact_protected/` (local, not
   versioned). The review records which findings were verified.
 - The owner chose Qwen 3.8 27B IQ2_XS only for subsequent live experiments.
   The 9B and Gemma results remain history; no further runs are planned.

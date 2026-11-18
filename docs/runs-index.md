@@ -59,6 +59,12 @@ are descriptions, not rate estimates. The incomplete run has only seeds
 0 and 1, with 36 rows. It stopped with the session/machine interruption,
 not a recorded code fault.
 
+Since 2026-11-18 the six `smoke-*` folders of 2026-11-16/17 (1,556 files)
+are stored in `runs/archive/smoke_runs_2026-11-17.zip`; the file count was
+verified before the folders were removed. The research reports and the
+documentation fact sheet are kept in folders whose names end in
+`_compact_protected`, so clean-ups leave them in place.
+
 `diag-27b-a` and `long-27b-pre` predate the ignored-tool-call notice added
 in `6c455a3`. Do not pool them with later conditions without stating that.
 `nearby` was removed in `8818724`; use `consolidated@request` now.
@@ -71,7 +77,7 @@ not versioned.
 
 | Folder | Contents | Reports it |
 |---|---|---|
-| `research-2026-11-16` | three ChatGPT 6.1 live-search reports and briefs; review written by Opus at `644f488` | literature review; project log phase 4 |
-| `docs-update-2026-11-18` | lead's fact sheet, computed tables, three trace analyses, adversarial build brief | notes 004/005; this documentation update |
+| `research-2026-11-16_compact_protected` | three ChatGPT 6.1 live-search reports and briefs; review written by Opus at `644f488` | literature review; project log phase 4 |
+| `context-2026-11-18_compact_protected` | lead's fact sheet, computed tables, three trace analyses, adversarial build brief | notes 004/005; this documentation update |
 | `tmp-codex` | disposable CLI temp/test scratch | local orchestrator guide |
 | `tmp-codex2` | separate disposable temp/test scratch for a concurrent builder | local orchestrator guide |
