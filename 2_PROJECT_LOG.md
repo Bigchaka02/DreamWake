@@ -1,6 +1,6 @@
 # 2 — Project log
 
-Concise record of what was done, in order. All of it happened on 2026-11-16.
+Concise record of work on 2026-11-16 to 2026-11-17. Updated 2026-11-18.
 Results are summarised here; the evidence is in `docs/notes/` and the run
 registry in `docs/runs-index.md`.
 
@@ -21,8 +21,20 @@ registry in `docs/runs-index.md`.
 | `1341a85` | note 002 |
 | `0b414e5` | practice reworked: executable scoring, rule-targeted dreams, tail cleaner |
 | `3096429` | README with status and commands; note 003 |
+| `0c5c7d1` | practice logs retain prior items, candidate and missing/present strings |
+| `664df72` | final repeats with shared seeds; temporary `nearby` design |
+| `644f488` | literature review from three research reports |
+| `8818724` | store/placement/gate grammar; oracle and requests diagnostics; `nearby` removed |
+| `685ec11` | task-defined sessions, optional stages, inheritance; `settings_resume` |
+| `3faf932` | `settings_long`; child/base reference lookup |
+| `29a963b` | request archive, schema output, single-rule edits, sleep seed spacing; review store |
+| `6c455a3` | ignored-tool-call notice and rows; hybrid last-request/status line |
+| `82c8dda` | dreaming second version: grounded exercises, controls, confirmed single-rule repair |
+| `aea50a8` | dreams ask for uncovered work; suffix requires a new separate feature |
+| `f630b95` | resumable demo, event callback, clean Ctrl+C interruption |
 
 ## Phase 0 — setup and inventory
+
 - Resolved paths: Desktop folder was empty; cloned the owner's public GitHub
   repository into it. No `gh` CLI; plain git with the stored credential.
 - Identified the two method repositories: `obra/superpowers` and
@@ -34,6 +46,7 @@ registry in `docs/runs-index.md`.
   only dreams that measurably help; all gains are parametric.
 
 ## Phase 1 — harness and first live runs
+
 - Task fixture `settings_gen` with hidden tests, reference states and
   validity tests. Agent loop, token trimming, handoff design and runner built
   and tested against a fake model.
@@ -47,6 +60,7 @@ registry in `docs/runs-index.md`.
   fixed in `d6f198f`.
 
 ### Fixes and calibration made in `d6f198f` (and why)
+
 - Evaluator restores `tests` and `tools` from the pristine snapshot (an agent
   could have rewritten the audit script).
 - Tool errors and check output no longer contain absolute paths; all final
@@ -62,6 +76,7 @@ registry in `docs/runs-index.md`.
   arguments (the server returned HTTP 500 otherwise).
 
 ## Phase 2 — baseline and consolidated memory (note 002)
+
 Qwen 3.5 9B, window 4096, 20 steps. Completion:
 
 | Run | workspace | handoff | consolidated |
@@ -77,6 +92,7 @@ Qwen 3.5 9B, window 4096, 20 steps. Completion:
   separate designs.
 
 ## Phase 3 — larger model and practice designs (note 003)
+
 - **Qwen 3.8 27B IQ2_XS (run C, `47bddd3`, 6 seeds): 0/6, 5/6, 6/6.** The
   application gap is mostly a 9B weakness.
 - First practice design, one-seed live smoke: replay scored everything
@@ -85,13 +101,77 @@ Qwen 3.5 9B, window 4096, 20 steps. Completion:
   plus cost.
 - Reworked in `0b414e5`: code-scored attempts, dreams written from the rules
   with their own `must_add` / `must_not_add` strings, cross-exercise accept
-  rule, `(replaces: …)` tail cleaner. **Passes 192 tests; not yet run live.**
+  rule, `(replaces: …)` tail cleaner. **At that point: 192 tests passed;
+  not yet run live.**
 
-## Housekeeping at the stopping point
+## Housekeeping at the first stopping point (2026-11-16)
+
 - LM Studio model unloaded and server stopped (as found).
 - Early run folders (probe, smoke, Gemma pilot, both wake checks, practice
-  smoke: 641 files) zipped to `runs/archive/early_runs_2026-11-16.zip` after
-  verifying the file count; the frozen git worktree `runs/wt-frozen` removed.
+  smoke: 641 files) zipped to `runs/archive/early_runs_2026-11-16.zip`
+  (local, not versioned) after verifying the file count; the frozen git
+  worktree `runs/wt-frozen` removed.
 - ChatGPT command-line route verified (see file 4).
 - One usage-limit interruption mid-session; three subagents resumed with no
   work lost.
+
+## Phase 4 — research (2026-11-16)
+
+- The owner requested extensive research on dreaming and harness design.
+  Three ChatGPT 6.1 live-search jobs covered practice, rule application and
+  evaluation. An Opus subagent condensed them into the literature review
+  (`644f488`); eight sources' numbers were checked against page text.
+- Research reports remain in `runs/research-2026-11-16/` (local, not
+  versioned). The review records which findings were verified.
+- The owner chose Qwen 3.8 27B IQ2_XS only for subsequent live experiments.
+  The 9B and Gemma results remain history; no further runs are planned.
+
+## Phase 5 — diagnostic and placement (note 004)
+
+- Last 9B checks: reworked practice still changed no rule. The one-seed
+  nearby check suggested testing placement; it was not a rate estimate.
+- Added final repeats, then separated store, placement and finish gate.
+  `nearby` became `consolidated@request`.
+- Qwen 3.8 short diagnostic (`8818724`, 8 seeds × 3): ideal rules and raw
+  requests 24/24, consolidated/request/gate 23/24 each, tail 18/24,
+  handoff 15/24. Our reading: the short task is saturated except for handoff.
+- Trace reading found prose rules present in failures, tail write loops,
+  a rubber-stamped gate, and silently ignored extra tool calls.
+
+## Phase 6 — longer histories and interruption (note 005)
+
+- Generalised sessions, stages and task inheritance. Built `settings_resume`
+  and `settings_long`; added request review and then hybrid's code-built
+  last-request/status line. Added an explicit ignored-call notice.
+- Interrupted task (`6c455a3`, 8 × 3): hybrid/handoff 24/24, requests 22/24,
+  consolidated/review 15/24, workspace 0/24. Rules alone lacked the goal.
+- Preliminary five-wake task (`29a963b`, 4 × 3, before the notice):
+  consolidated/review 7/12, handoff 2/12, requests 1/12, workspace 0/12.
+  Trace reading found a merge dropping a rule and a second-policy check
+  that can pass by copying a neighbour. The task flaw remains recorded.
+
+## Phase 7 — dreaming, second version (note 005)
+
+- Schema-enforced exercises quote real user decisions. Code filters and
+  positive controls verify dreams; one rule edit needs repeated improvement.
+  Practice restores protected files. Replay uses real requests 5 times.
+- One-seed live check at `82c8dda`: all four designs passed; no rule changed.
+  Existing-feature dreams made controls answer "already there". `aea50a8`
+  asks for uncovered work and adds a new-feature suffix to every dream.
+
+## Phase 8 — demo and stopping point (2026-11-17; note 005)
+
+- Built `python -m dreamwake.demo`, live event output and clean Ctrl+C.
+  Live hybrid demo: stopped at 6 steps with failed checks; new process used
+  stored memory, fixed template/audit work and passed in 11 steps.
+- The owner asked to reach a stopping point. Work stopped cleanly at
+  `f630b95` (01:52 local). The suite then passed 557 tests, about 4 minutes.
+- The five-wake comparison with practice started at 01:32 local. At about
+  02:07 all background jobs exited with code 4 together: session or machine
+  interruption, not a code fault. `long-27b-a` has **2 of 8 seeds**, 36 rows.
+  Hybrid 6/6, consolidated/review/dreaming 5/6, replay 4/6, handoff 0/6.
+  These are descriptions of **2 of 8 seeds**, not rates. No dream repair ran.
+- The frozen worktree was removed at the stopping point. Completing seeds
+  2–7 needs a new seed-offset option or a full rerun.
+- Documentation, including notes 004 and 005, was deferred until the owner's
+  explicit authorisation on 2026-11-18. This update records that work.

@@ -72,3 +72,14 @@ time; artifact size on disk and in injected tokens.
 Every result names where the gain persists: model parameters (none in the
 pilot — the installed models are served inference-only), stored artifacts, or
 context supplied at inference.
+
+## Amendments (2026-11-17)
+
+Recorded in the 2026-11-18 documentation update; the pilot text above is
+retained as the original protocol.
+
+- Sessions come from the task; optional `stage` selects hidden tests, null is unscored; wake validity is the last scored wake passing.
+- `--final-repeats N` repeats the final from the same memory/workspace, with seeds shared across designs; compare per seed.
+- Design grammar is `store[@placement][+gate]`: system (default), request, tail; gate returns notes at first finish; workspace has no modifiers.
+- `oracle` (hand-written ideal rules) and `requests` (verbatim user requests) are zero-model-call diagnostic stores.
+- Owner's model decision: Qwen 3.8 27B IQ2_XS only (`qwen3.8-27b-gsq-rco@iq2_xs`), context 4096, `--parallel 1`; retain 9B/Gemma results as history.
