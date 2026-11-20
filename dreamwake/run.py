@@ -158,7 +158,11 @@ def _final(task_id, design, wake, wake_ws, baseline, sessions, seed_dir, k, chat
     return rows
 
 
-def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3, final_repeats=1):
+def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wake_retries=3, final_repeats=1,
+                   first_seed=0):
+    """Run seeds first_seed..first_seed+seeds-1; every seed value derives from that index alone."""
+    if first_seed < 0:
+        raise ValueError("first_seed must be >= 0")
     parsed = [parse_design(design) for design in designs_]  # validate every spec before any model call
     task = tasks.load_task(task_id)
     sessions = task["sessions"]
@@ -181,13 +185,14 @@ def run_experiment(task_id, designs_, seeds, window, reserve, out_dir, chat, wak
         raise FileExistsError(f"{out / 'results.jsonl'} already exists: use a new --out directory")
     out.mkdir(parents=True, exist_ok=True)
     model = os.environ.get("DW_MODEL")
-    config = {"args": {"task": task_id, "designs": list(designs_), "seeds": seeds, "window": window,
+    config = {"args": {"task": task_id, "designs": list(designs_), "seeds": seeds, "first_seed": first_seed,
+                       "window": window,
                        "reserve": reserve, "out": str(out), "wake_retries": wake_retries,
                        "final_repeats": final_repeats},
               "model": model, "git_commit": _git_commit(), "git_dirty": _git_dirty(),
               "started": datetime.now(timezone.utc).isoformat()}
     (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    for k in range(seeds):
+    for k in range(first_seed, first_seed + seeds):
         seed_dir = out / f"seed{k}"
         rows = []  # written only once every design of this seed is done, so seeds stay paired
         try:
@@ -269,6 +274,8 @@ def main(argv=None):
     parser.add_argument("--task", default="settings_gen")
     parser.add_argument("--designs", default="workspace,handoff")
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--first-seed", type=int, default=0,
+                        help="index of the first seed (continue a run in a new --out with the same seed values)")
     parser.add_argument("--final-repeats", type=int, default=1)
     parser.add_argument("--window", type=int, default=4096)
     parser.add_argument("--reserve", type=int, default=1024)
@@ -282,11 +289,11 @@ def main(argv=None):
         return
     if not os.environ.get("DW_MODEL"):
         parser.error("set DW_MODEL to the model id served by the endpoint")
-    if not 0 < args.reserve < args.window or args.seeds < 1:
-        parser.error("need 0 < reserve < window and seeds >= 1")
+    if not 0 < args.reserve < args.window or args.seeds < 1 or args.first_seed < 0:
+        parser.error("need 0 < reserve < window, seeds >= 1 and first-seed >= 0")
     out = args.out or Path("runs") / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_experiment(args.task, args.designs.split(","), args.seeds, args.window, args.reserve, out, llm.chat,
-                   final_repeats=args.final_repeats)
+                   final_repeats=args.final_repeats, first_seed=args.first_seed)
     print(summarize(out))
 
 

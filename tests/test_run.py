@@ -231,6 +231,38 @@ def test_four_wakes_keep_order_snapshots_sleep_seeds_and_stages(tmp_path, monkey
             assert row["wake"] == {"first_passed": False, "second_passed": True, "trap_experienced": False}
 
 
+def test_first_seed_continues_with_the_same_seed_values(tmp_path, monkeypatch):
+    sessions = [{"id": "first", "prompt": "one", "max_steps": 4},
+                {"id": "last", "prompt": "end", "max_steps": 4}]
+    chat = tiny_task(tmp_path, monkeypatch, sessions)
+    real_sleep, sleep_seeds = designs.sleep, []
+
+    def sleep(store, artifact, events, **kwargs):
+        sleep_seeds.append(kwargs["seed"])
+        return real_sleep(store, artifact, events, **kwargs)
+    monkeypatch.setattr(designs, "sleep", sleep)
+    out = tmp_path / "out"
+    run.run_experiment("tiny", ["handoff"], 2, 4096, 700, out, chat, final_repeats=2, first_seed=3)
+    assert json.loads((out / "config.json").read_text(encoding="utf-8"))["args"]["first_seed"] == 3
+    assert sorted(p.name for p in out.glob("seed*")) == ["seed3", "seed4"]
+    assert [(r["seed"], r["repeat"]) for r in rows(out)] == [(3, 0), (3, 1), (4, 0), (4, 1)]
+    for i, k in enumerate((3, 4)):
+        wake, *finals = [seed for _, seed in chat.starts[i * 3:(i + 1) * 3]]
+        assert wake == k * run.SEED_STRIDE + run.ATTEMPT_STRIDE + 1
+        assert finals == [k * run.SEED_STRIDE + run.FINAL_OFFSET + r * run.SESSION_STRIDE + 1 for r in range(2)]
+    assert sleep_seeds == [k * run.SEED_STRIDE + 50_000 for k in (3, 4)]
+
+
+def test_first_seed_must_not_be_negative(tmp_path, monkeypatch, capsys):
+    with pytest.raises(ValueError, match="first_seed"):
+        run.run_experiment(TASK, ["workspace"], 1, 4096, 700, tmp_path / "out", None, first_seed=-1)
+    monkeypatch.setenv("DW_MODEL", "fake")
+    with pytest.raises(SystemExit):
+        run.main(["--first-seed", "-1", "--out", str(tmp_path / "cli")])
+    assert "first-seed >= 0" in capsys.readouterr().err
+    assert not (tmp_path / "cli").exists()
+
+
 def test_sleep_seed_range_has_room_and_stays_below_final():
     assert run.SLEEP_OFFSET == 50_000 and run.SLEEP_STRIDE == 1_000
     assert [run.SLEEP_OFFSET + i * run.SLEEP_STRIDE for i in range(9)] == [
@@ -869,7 +901,7 @@ def test_cli_defaults(monkeypatch):
     task, designs_, seeds, window, reserve, out, chat = seen["args"]
     assert (task, designs_, seeds, window, reserve, str(out)) == (
         "settings_gen", ["workspace", "handoff"], 3, 4096, 1024, "somewhere")
-    assert seen["kwargs"] == {"final_repeats": 1}
+    assert seen["kwargs"] == {"final_repeats": 1, "first_seed": 0}
 
 
 @pytest.mark.parametrize("count", [0, -1, 10])
@@ -888,7 +920,16 @@ def test_cli_forwards_repeats(monkeypatch, count):
     monkeypatch.setattr(run, "run_experiment", lambda *a, **kw: seen.update(kw))
     monkeypatch.setattr(run, "summarize", lambda out: "table")
     run.main(["--final-repeats", str(count), "--out", "somewhere"])
-    assert seen == {"final_repeats": count}
+    assert seen == {"final_repeats": count, "first_seed": 0}
+
+
+def test_cli_forwards_first_seed(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("DW_MODEL", "fake-model")
+    monkeypatch.setattr(run, "run_experiment", lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(run, "summarize", lambda out: "table")
+    run.main(["--first-seed", "2", "--seeds", "6", "--out", "somewhere"])
+    assert seen == {"final_repeats": 1, "first_seed": 2}
 
 
 def test_cli_summarize_prints_the_table(tmp_path, capsys):
